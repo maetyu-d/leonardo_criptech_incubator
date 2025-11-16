@@ -1,0 +1,821 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Many LLD Bots 2D</title>
+  <style>
+    html, body { margin: 0; padding: 0; background: #0b0d10; color: #e5e7eb; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica, Arial; }
+    #ui { position: fixed; top: 12px; left: 12px; background: rgba(15,17,21,.9); border: 1px solid rgba(255,255,255,.15); padding: 10px 12px; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.35); z-index: 10; max-width: min(980px, 92vw); }
+    #ui .row { display: flex; align-items: center; gap: .5rem; margin: .35rem 0; font-size: 13px; flex-wrap: wrap; color: #f0f0f0; }
+    #ui code { background: rgba(255,255,255,.1); padding: 2px 6px; border-radius: 6px; color: #fff; }
+    #ui select, #ui button, #ui input[type=range] { font-size: 13px; padding: 4px 8px; border-radius: 8px; border: 1px solid rgba(255,255,255,.25); background: #1f2329; color: #f5f5f5; }
+    #ui select option { background: #1f2329; color: #f5f5f5; }
+    #ui select:focus, #ui button:focus, #ui input[type=range]:focus { outline: 1px solid #66ccff; }
+    #ui label { opacity: 1; color: #f5f5f5; }
+    .group { border: 1px solid rgba(255,255,255,.12); border-radius: 10px; padding: 8px; background: rgba(255,255,255,.04); }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; width: 100%; }
+    .grid label { white-space: nowrap; }
+    .grid .control { display: flex; align-items: center; gap: 6px; }
+    canvas { display: block; }
+  </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.2/p5.min.js">
+// === Reactive reset on inner-shape changes (size or type) ===
+(function(){
+  function resetOnInnerChange(){
+    try {
+      if (typeof clearTrails === 'function') clearTrails();
+      if (typeof rebuildBots === 'function') rebuildBots();
+      if (typeof postSpawnSanity === 'function') postSpawnSanity();
+      if (typeof goals !== 'undefined') goals = [];
+      if (typeof scheduleNextGoal === 'function') scheduleNextGoal();
+      // keep safety passes running briefly
+      window.__greenSanityFrames = Math.max(window.__greenSanityFrames||0, 90);
+    } catch (e) {}
+  }
+
+  // Watch arenaShape and innerSizeFactor via property setters.
+  try {
+    // arenaShape watcher
+    if (!Object.getOwnPropertyDescriptor(window, 'arenaShape') || Object.getOwnPropertyDescriptor(window, 'arenaShape').configurable) {
+      let __arenaShape__ = window.arenaShape;
+      Object.defineProperty(window, 'arenaShape', {
+        configurable: true,
+        enumerable: true,
+        get(){ return __arenaShape__; },
+        set(v){ const changed = v !== __arenaShape__; __arenaShape__ = v; if (changed) resetOnInnerChange(); }
+      });
+    }
+  } catch(e){}
+
+  try {
+    // innerSizeFactor watcher
+    if (!Object.getOwnPropertyDescriptor(window, 'innerSizeFactor') || Object.getOwnPropertyDescriptor(window, 'innerSizeFactor').configurable) {
+      let __innerSizeFactor__ = (typeof window.innerSizeFactor !== 'undefined') ? window.innerSizeFactor : 1;
+      Object.defineProperty(window, 'innerSizeFactor', {
+        configurable: true,
+        enumerable: true,
+        get(){ return __innerSizeFactor__; },
+        set(v){ const changed = v !== __innerSizeFactor__; __innerSizeFactor__ = v; if (changed) resetOnInnerChange(); }
+      });
+    }
+  } catch(e){}
+
+  // Also hook common UI elements if present (sliders/selects)
+  try {
+    const ids = ['innerSize', 'inner_size', 'innerSizeSlider', 'inner-shape-size', 'innerShapeSelect', 'arenaShapeSelect'];
+    ids.forEach(id => {
+      const el = document.getElementById(id);
+      if (el) {
+        const fire = () => resetOnInnerChange();
+        el.addEventListener('input', fire);
+        el.addEventListener('change', fire);
+      }
+    });
+  } catch(e){}
+})();
+
+</script>
+</head>
+<body>
+  <div id="ui">
+    <div class="row"><strong>Many LLD Bots 2D</strong></div>
+    <div class="row">Press <code>E</code> export PNG of trails · <code>R</code> reset · <code>Space</code> pause · mouse wheel to zoom</div>
+
+    <div class="row">
+      <label for="ruleSelect"><strong>Rule preset:</strong></label>
+      <select id="ruleSelect">
+        <option value="free">Free roam</option>
+        <option value="seek_center">Seek center</option>
+        <option value="avoid_center">Orbit (avoid center)</option>
+        <option value="seek_goal">Seek rotating goal</option>
+        <option value="chase_goals">Chase random goals</option>
+        <option value="seek_edge">Seek outer edge</option>
+        <option value="align_swarm">Align with nearby bots</option>
+        <option value="repel_swarm">Repel nearby bots</option>
+        <option value="flock_balance">Flocking (simple)</option>
+        <option value="follow_leader">Follow a leader</option>
+        <optgroup label="Probabilistic">
+          <option value="prob_turn_bursts">Prob: random turn bursts</option>
+          <option value="prob_pause_dash">Prob: pause & dash</option>
+          <option value="prob_flip_goal">Prob: flip goal targets</option>
+        </optgroup>
+        <optgroup label="Emergent">
+          <option value="magnetic_swirl">Magnetic swirl</option>
+          <option value="predator_prey_a">Predator–prey A (orange→lime)</option>
+          <option value="predator_prey_b">Predator–prey B (lime→orange)</option>
+          <option value="entropy_drift">Entropy drift</option>
+          <option value="noise_field">Noise field</option>
+        </optgroup>
+      </select>
+
+      <label for="shapeSelect"><strong>World:</strong></label>
+      <select id="shapeSelect">
+        <option value="circle" selected>Circle</option>
+        <option value="square">Square</option>
+        <option value="triangle">Triangle</option>
+        <option value="h">H shape</option>
+        <optgroup label="Square + inner shape (slow lime)">
+          <option value="square_inner_square">Square + inner square</option>
+          <option value="square_inner_circle">Square + inner circle</option>
+          <option value="square_inner_triangle">Square + inner triangle</option>
+        </optgroup>
+      </select>
+      <button id="clearBtn">Clear trails</button>
+    </div>
+
+    <div class="row" id="thicknessRow">
+      <label for="thicknessSlider"><strong>Trail thickness:</strong></label>
+      <input id="thicknessSlider" type="range" min="0.5" max="50" step="0.1" value="1" />
+      <span id="thicknessValue">1.0 px</span>
+    </div>
+
+    <div class="row" id="alphaRow">
+      <label for="alphaSlider"><strong>Trail transparency ×</strong></label>
+      <input id="alphaSlider" type="range" min="0.10" max="3.00" step="0.05" value="1.00" />
+      <span id="alphaValue">1.00×</span>
+    </div>
+
+    <div class="row" id="innerSizeRow" style="display:none;">
+      <label for="innerSize"><strong>Inner shape size ×</strong></label>
+      <input id="innerSize" type="range" min="0.10" max="1.50" step="0.05" value="1" />
+      <span id="innerSizeV">1.00×</span>
+    </div>
+
+    <div class="row" id="limpRow">
+      <label for="limpSlider"><strong>Limping amount ×</strong></label>
+      <input id="limpSlider" type="range" min="0" max="3" step="0.05" value="1" />
+      <span id="limpValue">1.00×</span>
+    </div>
+
+    <div class="row" id="instabRow">
+      <label for="instabSlider"><strong>Asymmetric instability</strong></label>
+      <input id="instabSlider" type="range" min="-1" max="1" step="0.01" value="0" style="width:220px" />
+      <span id="instabValue">0.00 (neutral)</span>
+    </div>
+
+    <div class="row" id="spinRow">
+      <label for="spinRate"><strong>Spinout rate (1/s)</strong></label>
+      <input id="spinRate" type="range" min="0" max="0.50" step="0.01" value="0.08" />
+      <span id="spinRateV">0.08</span>
+
+      <label for="spinDur"><strong>Spinout duration (s)</strong></label>
+      <input id="spinDur" type="range" min="0.1" max="3.0" step="0.1" value="1.0" />
+      <span id="spinDurV">1.0</span>
+
+      <label for="spinMag"><strong>Spin magnitude (rad/s)</strong></label>
+      <input id="spinMag" type="range" min="1" max="15" step="0.5" value="6" />
+      <span id="spinMagV">6.0</span>
+    </div>
+
+    <div class="row group" id="probGroup">
+      <strong>Probabilistic parameters</strong>
+      <div class="grid">
+        <label for="burstRate">Burst rate (1/s)</label>
+        <div class="control"><input id="burstRate" type="range" min="0" max="2" step="0.05" value="0.6"><span id="burstRateV">0.60</span></div>
+        <label for="burstMag">Burst max turn (rad/s)</label>
+        <div class="control"><input id="burstMag" type="range" min="0.5" max="5" step="0.1" value="3.5"><span id="burstMagV">3.5</span></div>
+        <label for="burstDur">Burst max dur (s)</label>
+        <div class="control"><input id="burstDur" type="range" min="0.1" max="2" step="0.05" value="0.6"><span id="burstDurV">0.60</span></div>
+
+        <label for="pauseRate">Pause rate (1/s)</label>
+        <div class="control"><input id="pauseRate" type="range" min="0" max="1" step="0.02" value="0.25"><span id="pauseRateV">0.25</span></div>
+        <label for="pauseDur">Pause max dur (s)</label>
+        <div class="control"><input id="pauseDur" type="range" min="0.1" max="2" step="0.05" value="0.6"><span id="pauseDurV">0.60</span></div>
+
+        <label for="dashRate">Dash rate (1/s)</label>
+        <div class="control"><input id="dashRate" type="range" min="0" max="1" step="0.02" value="0.25"><span id="dashRateV">0.25</span></div>
+        <label for="dashDur">Dash max dur (s)</label>
+        <div class="control"><input id="dashDur" type="range" min="0.1" max="2" step="0.05" value="0.5"><span id="dashDurV">0.50</span></div>
+        <label for="dashMul">Dash speed ×</label>
+        <div class="control"><input id="dashMul" type="range" min="1" max="5" step="0.1" value="2.2"><span id="dashMulV">2.2</span></div>
+
+        <label for="flipRate">Flip rate (1/s)</label>
+        <div class="control"><input id="flipRate" type="range" min="0" max="1" step="0.02" value="0.2"><span id="flipRateV">0.20</span></div>
+
+        <label for="spawnFactor" id="spawnRowLabel">Goal spawn interval ×</label>
+        <div class="control" id="spawnRowCtl"><input id="spawnFactor" type="range" min="0.1" max="5" step="0.1" value="1"><span id="spawnFactorV">1.0×</span></div>
+      </div>
+    </div>
+
+    <div class="row" id="status"></div>
+  </div>
+
+  <script>
+    // === World ===
+    const ARENA_DIAM = 10000;
+    const ARENA_RADIUS = ARENA_DIAM / 2;
+    const NUM_GREEN = 1000;   // limping asymmetric (lime)
+    const NUM_ORANGE = 1000;  // standard symmetric (orange)
+
+    // === Globals ===
+    // Zoom
+    let zoomFactor = 1.0; // 1x
+    const zoomMin = 0.2;
+    const zoomMax = 5.0;
+
+    let trails, hiResTrails, scaleFactor, paused = false, bots = [];
+    let currentRule = 'free';
+    let arenaShape = 'circle';
+    let goals = [];
+    let nextGoalTime = 0;
+    let rotatingGoalAngle = 0; // radians
+
+    // hi-res export scaling
+    const HI_W = 10000, HI_H = 10000;
+    const HI_SCALE = HI_W / ARENA_DIAM; // 1 world px -> 1 image px
+
+    // Trail thickness (screen px). Hi-res scales proportionally.
+    let trailThickness = 1;
+
+    // Probabilistic params
+    const BASE_GOAL_MS = 20000;
+    let goalSpawnFactor = 1.0;
+    let innerSizeFactor = 1.0; // multiplier for inner shape size
+    let prob = {
+      burstRate: 0.6, burstMagMax: 3.5, burstDurMax: 0.6,
+      pauseRate: 0.25, pauseDurMax: 0.6,
+      dashRate: 0.25, dashDurMax: 0.5, dashMul: 2.2,
+      flipRate: 0.2
+    };
+
+    // Green bot limp + instability + spinout controls
+    let greenLimpScale = 1.0;           // 0..3 × limping amount (freq & amp)
+    let greenInstabilityBias = 0.0;     // -1 (left) .. 0 (neutral) .. +1 (right)
+    let SPINOUT = { rate: 0.08, durMin: 0.4, durMax: 1.8, magMin: 4.0, magMax: 10.0 };
+
+    // Trail transparency multiplier (applies to both colors)
+    const BASE_ALPHA = { lime: 40, orange: 36 };
+    let trailAlphaMul = 1.0; // 0.10× .. 3.00×
+
+    // UI elements
+    let ruleSelectEl, shapeSelectEl, statusEl, thicknessSliderEl, thicknessValueEl;
+
+    // Fit using COVER so arena can fill the long side; we use hi-res sampling for view
+    function computeScale() { 
+      const dim = Math.max(windowWidth, windowHeight);
+      return dim / ARENA_DIAM;
+    }
+    function worldToScreen(vec, sf = scaleFactor, w = width, h = height) { const cx = w / 2, cy = h / 2; return createVector(cx + vec.x * sf, cy + vec.y * sf); }
+
+    // === Bot ===
+    class Bot {
+      constructor({color=color(255), speed=70, biasTurn=0, limpFreq=0, limpAmp=0, noiseScale=0.2, kind}) {
+        this.pos = createVector(0,0);
+        this.prevPos = this.pos.copy();
+        this.heading = Math.random() * Math.PI * 2;
+        this.baseSpeed = speed + random(-8, 8);
+        this.biasTurn = biasTurn; // rad/s
+        this.limpFreq = limpFreq; // Hz
+        this.limpAmp  = limpAmp;  // rad/s
+        this.limpPhase = random(TWO_PI);
+        this.noiseZ = random(1000);
+        this.noiseScale = noiseScale; // rad/s amplitude
+        this.stroke = color;
+        this.kind = kind || 'lime';
+        // Probabilistic state
+        this.burstT = 0; this.pausedT = 0; this.dashT = 0; this.flipSide = 1;
+        // Spinout state (greens)
+        this.spinT = 0; this.spinDir = 1; this.spinMag = 0;
+      }
+
+      update(dt) {
+        dt = min(dt, 0.05);
+        this.prevPos = this.pos.copy();
+
+        // base noise/wobble/turn
+        const wobble = this.limpAmp * Math.sin(TWO_PI * this.limpFreq * millis()/1000 + this.limpPhase);
+        const jitter = (noise(this.noiseZ) - 0.5) * this.noiseScale * 2; this.noiseZ += 0.0025;
+        let turnRate = this.biasTurn + wobble + jitter;
+        let speedMul = 1.0;
+
+        // === Rule steering ===
+        if (currentRule === 'seek_center') {
+          const inward = this.pos.copy().mult(-1).heading();
+          turnRate += steerToward(this.heading, inward, 0.9);
+        } else if (currentRule === 'avoid_center') {
+          const tangential = this.pos.heading() + HALF_PI; turnRate += steerToward(this.heading, tangential, 0.7);
+        } else if (currentRule === 'seek_goal') {
+          const gpos = movingGoalPos(); const desired = p5.Vector.sub(gpos, this.pos).heading(); turnRate += steerToward(this.heading, desired, 1.0);
+        } else if (currentRule === 'chase_goals' && goals.length) {
+          const target = nearestGoal(this.pos); if (target) { const desired = p5.Vector.sub(target.pos, this.pos).heading(); turnRate += steerToward(this.heading, desired, 1.2); }
+        } else if (currentRule === 'seek_edge') {
+          const desired = this.pos.heading() + HALF_PI * 0.05; turnRate += steerToward(this.heading, desired, 0.8);
+        } else if (currentRule === 'align_swarm' || currentRule === 'repel_swarm' || currentRule === 'flock_balance' || currentRule === 'follow_leader') {
+          const sampleCount=6; let avgHeading=0, avgVec=createVector(0,0), count=0;
+          for (let i=0;i<sampleCount;i++){ const other=bots[(Math.random()*bots.length)|0]; if(other===this) continue; const d=p5.Vector.dist(this.pos,other.pos); if(d<800){ avgHeading+=other.heading; count++; avgVec.add(other.pos);} }
+          if (count>0){ avgHeading/=count; avgVec.div(count);
+            if (currentRule==='align_swarm') turnRate += steerToward(this.heading, avgHeading, 0.8);
+            else if (currentRule==='repel_swarm') { const away=p5.Vector.sub(this.pos,avgVec).heading(); turnRate += steerToward(this.heading, away, 1.0); }
+            else if (currentRule==='flock_balance') { const toC=p5.Vector.sub(avgVec,this.pos).heading(); const away=p5.Vector.sub(this.pos,avgVec).heading(); turnRate += steerToward(this.heading, avgHeading,0.6)+steerToward(this.heading, away,0.9)+steerToward(this.heading, toC,0.2); }
+            else if (currentRule==='follow_leader'){ const leader=bots[0]; const desired=p5.Vector.sub(leader.pos,this.pos).heading(); turnRate += steerToward(this.heading, desired, 1.1); }
+          }
+        } else if (currentRule.startsWith('prob_')) {
+          if (currentRule === 'prob_turn_bursts') {
+            if (this.burstT <= 0 && Math.random() < prob.burstRate * dt) { this.burstT = random(0.15, prob.burstDurMax); this.burstDir = random([-1,1]); this.burstMag = random(Math.max(0.4*prob.burstMagMax,0.1), prob.burstMagMax); }
+            if (this.burstT > 0) { turnRate += this.burstDir * this.burstMag; this.burstT -= dt; }
+          } else if (currentRule === 'prob_pause_dash') {
+            if (this.pausedT <= 0 && this.dashT <= 0) { if (Math.random() < prob.pauseRate * dt) this.pausedT = random(0.1, prob.pauseDurMax); else if (Math.random() < prob.dashRate * dt) this.dashT = random(0.1, prob.dashDurMax); }
+            if (this.pausedT > 0) { speedMul *= 0.1; this.pausedT -= dt; }
+            if (this.dashT > 0) { speedMul *= prob.dashMul; this.dashT -= dt; }
+          } else if (currentRule === 'prob_flip_goal') {
+            if (Math.random() < prob.flipRate * dt) this.flipSide *= -1; const base=movingGoalPos(); const alt=p5.Vector.mult(base,-1); const target=(this.flipSide===1)?base:alt; const desired=p5.Vector.sub(target,this.pos).heading(); turnRate += steerToward(this.heading, desired, 1.1);
+          }
+        } else if (currentRule === 'magnetic_swirl') {
+          const t = millis() * 0.0001; const pole = createVector(Math.cos(t)*ARENA_RADIUS*0.3, Math.sin(t)*ARENA_RADIUS*0.3);
+          const desired = p5.Vector.sub(pole, this.pos).heading() + HALF_PI; turnRate += steerToward(this.heading, desired, 1.0);
+        } else if (currentRule === 'predator_prey_a' || currentRule === 'predator_prey_b') {
+          const limeBots = bots.filter(b=>b.kind==='lime'); const orangeBots = bots.filter(b=>b.kind==='orange');
+          if (currentRule==='predator_prey_a' && this.kind==='orange') { const target = random(limeBots); const desired = p5.Vector.sub(target.pos, this.pos).heading(); turnRate += steerToward(this.heading, desired, 1.3); }
+          if (currentRule==='predator_prey_b' && this.kind==='lime')   { const target = random(orangeBots); const desired = p5.Vector.sub(target.pos, this.pos).heading(); turnRate += steerToward(this.heading, desired, 1.3); }
+        } else if (currentRule === 'entropy_drift') {
+          this.biasTurn = constrain(this.biasTurn + random(-0.02,0.02), -0.3, 0.3);
+        } else if (currentRule === 'noise_field') {
+          const n = noise(this.pos.x * 0.0002, this.pos.y * 0.0002, millis() * 0.0001); const a = map(n,0,1,-PI,PI); turnRate += steerToward(this.heading, a, 0.8);
+        }
+
+        // === Spinout (greens only) ===
+        if (this.kind==='lime') {
+          if (this.spinT <= 0 && Math.random() < SPINOUT.rate * dt) {
+            this.spinT = random(SPINOUT.durMin, SPINOUT.durMax);
+            this.spinDir = random([-1,1]);
+            this.spinMag = random(SPINOUT.magMin, SPINOUT.magMax);
+          }
+          if (this.spinT > 0) { turnRate += this.spinDir * this.spinMag; this.spinT -= dt; }
+        }
+
+        // Boundary steer near wall (shape-aware)
+        const distEdge = insideDistanceToEdge(this.pos);
+        if (distEdge < 400) { const inward = createVector(-this.pos.x, -this.pos.y).heading(); const gain = map(distEdge, 400, 0, 0.3, 1.6, true); const delta = angleDelta(this.heading, inward); turnRate += constrain(delta, -1, 1) * gain; }
+
+        // Speed multiplier from inner shapes (lime penalty region)
+        speedMul *= innerShapeSpeedMul(this.pos, this.kind);
+
+        // Integrate
+        this.heading += turnRate * dt;
+        const step = this.baseSpeed * dt * speedMul;
+        this.pos.x += Math.cos(this.heading) * step;
+        this.pos.y += Math.sin(this.heading) * step;
+
+        // Keep inside
+        if (!isInsideWorld(this.pos)) { const projected = projectInsideWorld(this.pos); this.pos.set(projected.x, projected.y); const inward = createVector(-this.pos.x, -this.pos.y).heading(); this.heading = inward; this.prevPos = this.pos.copy(); }
+
+        // Prevent jump-chords
+        if (p5.Vector.dist(this.prevPos, this.pos) > 200) this.prevPos = this.pos.copy();
+      }
+
+      drawTrail(g, sf = scaleFactor, w = width, h = height) {
+        const s1 = worldToScreen(this.prevPos, sf, w, h);
+        const s2 = worldToScreen(this.pos, sf, w, h);
+        const weight = (sf === HI_SCALE) ? trailThickness * (HI_SCALE / scaleFactor) : trailThickness;
+        let col = this.stroke; // identical alpha on screen & export
+        g.stroke(col); g.strokeWeight(weight); g.line(s1.x, s1.y, s2.x, s2.y);
+      }
+    }
+
+    // Factories (spawn later sets position)
+    function makeLimpingBot(){ return new Bot({ kind:'lime', color: getTrailColor('lime'), speed:70, biasTurn:0, limpFreq:0, limpAmp:0, noiseScale:0.3 }); }
+    function makeOrangeBot(){ return new Bot({ kind:'orange', color: getTrailColor('orange'), speed:80, biasTurn:0, limpFreq:0, limpAmp:0, noiseScale:0.08 }); }
+
+    // Spawn per current arena shape (avoid placing lime inside inner slow zone)
+    function rebuildBots(){
+      bots = [];
+      for (let i = 0; i < NUM_GREEN; i++) bots.push(spawnBot('lime'));
+      for (let i = 0; i < NUM_ORANGE; i++) bots.push(spawnBot('orange'));
+    
+  postSpawnSanity();
+}
+
+    function spawnBot(kind) {
+      let pos;
+      let attempts = 0;
+      do {
+        attempts++;
+        if (arenaShape === 'circle') {
+          let r = ARENA_RADIUS * Math.sqrt(Math.random());
+          let a = Math.random() * TWO_PI;
+          pos = createVector(r * Math.cos(a), r * Math.sin(a));
+        } else if (arenaShape.startsWith('square')) {
+          pos = createVector(random(-ARENA_RADIUS, ARENA_RADIUS), random(-ARENA_RADIUS, ARENA_RADIUS));
+        } else if (arenaShape === 'triangle') {
+          const verts = triangleVerts(ARENA_RADIUS);
+          let a = random(), b = random();
+          if (a + b > 1) { a = 1 - a; b = 1 - b; }
+          pos = p5.Vector.add(verts[0], p5.Vector.add(p5.Vector.mult(p5.Vector.sub(verts[1], verts[0]), a), p5.Vector.mult(p5.Vector.sub(verts[2], verts[0]), b)));
+        } else if (arenaShape === 'h') {
+          const rects = hRects();
+          const r = random(rects);
+          pos = createVector(r.cx + random(-r.hw, r.hw), r.cy + random(-r.hh, r.hh));
+        }
+        if (kind === 'lime' && arenaShape.startsWith('square_inner_')) {
+          const inner = innerShapeSpec();
+          if (inner && pointInInnerShape(pos)) continue; // resample to avoid slow zone spawn
+        }
+      } while ((!isInsideWorld(pos)) && attempts < 200);
+
+      if ((!pos || !isInsideWorld(pos)) && arenaShape.startsWith('square')) {
+        const R = ARENA_RADIUS - 1;
+        pos = createVector(random([-R, R]), random(-R, R));
+      }
+
+      let bot;
+      if (kind === 'lime') {
+        const baseFreq = random(0.15, 0.35) * greenLimpScale;
+        const baseAmp  = random(0.25, 0.65) * greenLimpScale;
+        const baseBias = random(0.05, 0.22);
+        const biasTurn = map(greenInstabilityBias, -1, 1, -baseBias, baseBias);
+        bot = new Bot({ kind: 'lime', color: getTrailColor('lime'), speed:70, biasTurn, limpFreq: baseFreq, limpAmp: baseAmp, noiseScale:0.3 });
+      } else {
+        bot = new Bot({ kind: 'orange', color: getTrailColor('orange'), speed:80, biasTurn:0, limpFreq:0, limpAmp:0, noiseScale:0.08 });
+      }
+      bot.pos = pos;
+      bot.prevPos = pos.copy();
+      bot.heading = random(TWO_PI);
+      return bot;
+    }
+
+    // Clears only the true history buffer (hi-res). On-screen view resamples it.
+    function clearTrails(){ hiResTrails.background(0); }
+
+    function draw(){
+      
+  
+  // === Frame-level inner-shape change reset (robust) ===
+  (function(){
+    let key = 'none';
+    try {
+      const spec = (typeof innerShapeSpec === 'function') ? innerShapeSpec() : null;
+      const type = spec && spec.type ? spec.type : 'none';
+      const size = spec && spec.size ? spec.size : 0;
+      // Include arenaShape to catch type changes too
+      key = String(arenaShape) + '|' + type + '|' + (Math.round(size*1000)/1000);
+    } catch(e){}
+    if (typeof window.__innerResetKey === 'undefined') window.__innerResetKey = key;
+    if (window.__innerResetKey !== key) {
+      window.__innerResetKey = key;
+      try {
+        if (typeof clearTrails === 'function') clearTrails();
+        if (typeof rebuildBots === 'function') rebuildBots();
+        if (typeof postSpawnSanity === 'function') postSpawnSanity();
+        if (typeof goals !== 'undefined') goals = [];
+        if (typeof scheduleNextGoal === 'function') scheduleNextGoal();
+        // run extra sanitation frames after a reset
+        window.__greenSanityFrames = Math.max(window.__greenSanityFrames||0, 90);
+      } catch(e){}
+    }
+  })();
+if (typeof window.__greenSanityFrames === 'undefined') window.__greenSanityFrames = 30;
+  if (window.__greenSanityFrames-- > 0) postSpawnSanity();
+rotatingGoalAngle += 0.2 * (deltaTime/1000);
+      const now = millis();
+      if ((currentRule === 'chase_goals') && now >= nextGoalTime) { spawnGoal(); scheduleNextGoal(); }
+      goals = goals.filter(g => now - g.born < g.ttl);
+
+      if (paused) { background(11,13,16); drawViewportFromHiRes(); drawOverlay(); return; }
+
+      const dt = min(deltaTime / 1000, 0.05);
+      for (let b of bots) { b.update(dt); b.drawTrail(hiResTrails, HI_SCALE, HI_W, HI_H); }
+
+      background(11,13,16);
+      drawViewportFromHiRes();
+      drawOverlay();
+    }
+
+    // === Overlay & World ===
+    function drawOverlay(){
+      push(); noFill(); stroke(200,210,220,80); strokeWeight(1.2); drawWorldOutline(scaleFactor, width, height);
+      drawInnerShapeOutline(scaleFactor, width, height);
+      if (currentRule === 'seek_goal') { const gp = movingGoalPos(); drawGoalMarker(gp, color(80,200,255,180)); }
+      if (currentRule === 'chase_goals') { for (const g of goals) drawGoalMarker(g.pos, color(255,230,80,200)); }
+      noStroke(); fill(220,225,230,65); textAlign(LEFT, BOTTOM); textSize(12);
+      text(`Rule: ${labelForRule(currentRule)} | World: ${arenaShape.toUpperCase()} | Thickness: ${trailThickness.toFixed(1)}px | Opacity ×${trailAlphaMul.toFixed(2)} | Spin r=${SPINOUT.rate.toFixed(2)}/s | Spawn ×${goalSpawnFactor.toFixed(1)} | Inner ×${innerSizeFactor.toFixed(2)} | Limp ×${greenLimpScale.toFixed(2)} | Bias ${greenInstabilityBias.toFixed(2)}`, 10, height-10);
+      pop();
+    }
+    function drawGoalMarker(worldPos, c){ const s = worldToScreen(worldPos); push(); noFill(); stroke(c); strokeWeight(2); circle(s.x,s.y,10); strokeWeight(1); line(s.x-6,s.y,s.x+6,s.y); line(s.x,s.y-6,s.x,s.y+6); pop(); }
+
+    function drawWorldOutline(sf,w,h){ const c = worldToScreen(createVector(0,0), sf, w, h); const R = ARENA_RADIUS * sf; if (arenaShape.startsWith('square')) { rectMode(CENTER); rect(c.x, c.y, R*2, R*2); }
+      else if (arenaShape==='circle') circle(c.x, c.y, R*2);
+      else if (arenaShape==='triangle') { const verts = triangleVerts(ARENA_RADIUS); const s = verts.map(v => worldToScreen(v, sf, w, h)); triangle(s[0].x,s[0].y,s[1].x,s[1].y,s[2].x,s[2].y); }
+      else if (arenaShape==='h') { const Rw=ARENA_RADIUS, Rh=ARENA_RADIUS; rectMode(CENTER); rect(c.x-Rw*0.7,c.y,Rw*0.6,Rh*2); rect(c.x+Rw*0.7,c.y,Rw*0.6,Rh*2); rect(c.x,c.y,Rw*2,Rh*0.4); }
+    }
+
+    function drawInnerShapeOutline(sf,w,h){
+      const c = worldToScreen(createVector(0,0), sf, w, h); const inner = innerShapeSpec(); if (!inner) return;
+      push(); noFill(); stroke(120,180,255,90); strokeWeight(1);
+      if (inner.type==='square') { const s = inner.size * sf * 2; rectMode(CENTER); rect(c.x,c.y,s,s); }
+      if (inner.type==='circle') { circle(c.x, c.y, inner.size*2*sf); }
+      if (inner.type==='triangle') { const verts = triangleVerts(inner.size); const s = verts.map(v => worldToScreen(v, sf, w, h)); triangle(s[0].x,s[0].y,s[1].x,s[1].y,s[2].x,s[2].y); }
+      pop();
+    }
+
+    // === World geometry ===
+    function isInsideWorld(p){ const x=p.x,y=p.y,R=ARENA_RADIUS; if (arenaShape==='circle') return x*x+y*y<=R*R; if (arenaShape.startsWith('square')) return Math.abs(x)<=R && Math.abs(y)<=R; if (arenaShape==='triangle') return pointInTriangle(p, ...triangleVerts(R)); if (arenaShape==='h') return pointInH(p); return true; }
+    function insideDistanceToEdge(p){ const x=p.x,y=p.y,R=ARENA_RADIUS; if (arenaShape==='circle') return Math.max(0,R-Math.hypot(x,y)); if (arenaShape.startsWith('square')) return Math.max(0,R-Math.max(Math.abs(x),Math.abs(y))); if (arenaShape==='triangle'){ const verts=triangleVerts(R); return Math.min(distPointToSegment(p,verts[0],verts[1]),distPointToSegment(p,verts[1],verts[2]),distPointToSegment(p,verts[2],verts[0])); } if (arenaShape==='h'){ const rects=hRects(); let dmin=Infinity,insideAny=false; for(const r of rects){ if(pointInRect(p,r)){ insideAny=true; dmin=Math.min(dmin,distToRectEdge(p,r)); } } return insideAny?dmin:0; } return 0; }
+    function projectInsideWorld(p){ const x=p.x,y=p.y,R=ARENA_RADIUS; if (arenaShape==='circle'){ const d=Math.hypot(x,y); if(!d) return createVector(0,0); const k=(R-0.5)/d; return createVector(x*k,y*k); } if (arenaShape.startsWith('square')){ return createVector(constrain(x,-R+0.5,R-0.5), constrain(y,-R+0.5,R-0.5)); } if (arenaShape==='triangle'){ const verts=triangleVerts(R); return closestPointOnPolygon(p,verts); } if (arenaShape==='h'){ const rects=hRects(); let best=null,bestD=Infinity; for(const r of rects){ const q=clampToRect(p,r); const d=p5.Vector.dist(p,q); if(d<bestD){ bestD=d; best=q; } } return best||createVector(0,0); } return p.copy(); }
+
+    // Inner shape spec for square+inner-* arenas (include base for clamping)
+    function innerShapeSpec(){
+      if (arenaShape==='square_inner_square') return {type:'square', base: 0.35, size: ARENA_RADIUS*0.35*innerSizeFactor};
+      if (arenaShape==='square_inner_circle') return {type:'circle', base: 0.38, size: ARENA_RADIUS*0.38*innerSizeFactor};
+      if (arenaShape==='square_inner_triangle') return {type:'triangle', base: 0.40, size: ARENA_RADIUS*0.40*innerSizeFactor};
+      return null;
+    }
+
+    function pointInInnerShape(p){ const spec = innerShapeSpec(); if (!spec) return false; const s = spec.size; if (spec.type==='square') return Math.abs(p.x)<=s && Math.abs(p.y)<=s; if (spec.type==='circle') return (p.x*p.x + p.y*p.y) <= s*s; if (spec.type==='triangle') return pointInTriangle(p, ...triangleVerts(s)); return false; }
+
+    // Lime slow region: 0.2× inside inner shape; orange unaffected
+    function innerShapeSpeedMul(pos, kind){ if (!innerShapeSpec()) return 1.0; if (kind==='orange') return 1.0; return pointInInnerShape(pos) ? 0.2 : 1.0; }
+
+    function triangleVerts(R){ const rr=R*0.98; return [ createVector(rr*Math.cos(-Math.PI/2), rr*Math.sin(-Math.PI/2)), createVector(rr*Math.cos(-Math.PI/2+2*Math.PI/3), rr*Math.sin(-Math.PI/2+2*Math.PI/3)), createVector(rr*Math.cos(-Math.PI/2+4*Math.PI/3), rr*Math.sin(-Math.PI/2+4*Math.PI/3)) ]; }
+
+// === Green spawn/relocate helpers ===
+function _innerSpecSafe(){ try { return innerShapeSpec ? innerShapeSpec() : null; } catch(e){ return null; } }
+function _insideInner(p){
+  try {
+    const spec = _innerSpecSafe();
+    if (!spec) return false;
+    if (typeof pointInInnerShape === 'function' && pointInInnerShape(p)) return true;
+    if (typeof innerShapeSpeedMul === 'function' && innerShapeSpeedMul(p, 'lime') < 1.0) return true;
+  } catch (e) {}
+  return false;
+}
+function _sampleWorld(){
+  if (arenaShape === 'circle') {
+    let r = ARENA_RADIUS * Math.sqrt(Math.random());
+    let a = Math.random() * TWO_PI;
+    return createVector(r * Math.cos(a), r * Math.sin(a));
+  } else if (arenaShape.startsWith('square')) {
+    return createVector(random(-ARENA_RADIUS, ARENA_RADIUS), random(-ARENA_RADIUS, ARENA_RADIUS));
+  } else if (arenaShape === 'triangle') {
+    const verts = triangleVerts(ARENA_RADIUS);
+    let a = random(), b = random();
+    if (a + b > 1) { a = 1 - a; b = 1 - b; }
+    return p5.Vector.add(verts[0], p5.Vector.add(p5.Vector.mult(p5.Vector.sub(verts[1], verts[0]), a), p5.Vector.mult(p5.Vector.sub(verts[2], verts[0]), b)));
+  } else if (arenaShape === 'h') {
+    const rects = hRects();
+    const r = random(rects);
+    return createVector(r.cx + random(-r.hw, r.hw), r.cy + random(-r.hh, r.hh));
+  }
+  return createVector(0,0);
+}
+function _sampleOutsideInner(){
+  const spec = _innerSpecSafe();
+  if (!spec) return _sampleWorld();
+  if (spec.type === 'circle') {
+    const R = ARENA_RADIUS, s = spec.size;
+    const r = Math.sqrt(random() * (R*R - s*s) + s*s);
+    const a = random(TWO_PI);
+    return createVector(r * Math.cos(a), r * Math.sin(a));
+  }
+  if (spec.type === 'square' && (arenaShape.startsWith('square'))) {
+    const R = ARENA_RADIUS, s = spec.size;
+    // sample from one of 4 strips uniformly
+    if (random() < 0.5) {
+      // left/right strips
+      const side = random() < 0.5 ? -1 : 1;
+      const x = side * random(s, R);
+      const y = random(-R, R);
+      return createVector(x, y);
+    } else {
+      // top/bottom strips
+      const top = random() < 0.5 ? 1 : -1;
+      const y = top * random(s, R);
+      const x = random(-R, R);
+      return createVector(x, y);
+    }
+  }
+  if (spec.type === 'triangle') {
+    const outer = triangleVerts(ARENA_RADIUS);
+    const inner = triangleVerts(spec.size);
+    for (let i=0;i<20000;i++){
+      let a = random(), b = random();
+      if (a + b > 1) { a = 1 - a; b = 1 - b; }
+      const p = p5.Vector.add(outer[0], p5.Vector.add(p5.Vector.mult(p5.Vector.sub(outer[1], outer[0]), a), p5.Vector.mult(p5.Vector.sub(outer[2], outer[0]), b)));
+      if (!pointInTriangle(p, inner[0], inner[1], inner[2])) return p;
+    }
+    return outer[0].copy();
+  }
+  return _sampleWorld();
+}
+function relocateGreenIfInsideInner(bot){
+  if (!bot || bot.kind !== 'lime') return;
+  let guard = 0;
+  while ((_innerSpecSafe()) && _insideInner(bot.pos) && guard++ < 5000){
+    bot.pos = _sampleOutsideInner();
+    if (!isInsideWorld(bot.pos)) bot.pos = _sampleWorld();
+  }
+  bot.prevPos = bot.pos.copy();
+}
+function postSpawnSanity(){
+  if (!Array.isArray(bots)) return;
+  for (let i=0; i<bots.length; i++){
+    relocateGreenIfInsideInner(bots[i]);
+  }
+}
+    function pointInTriangle(p,a,b,c){ const v0=p5.Vector.sub(c,a), v1=p5.Vector.sub(b,a), v2=p5.Vector.sub(p,a); const dot00=v0.dot(v0), dot01=v0.dot(v1), dot02=v0.dot(v2), dot11=v1.dot(v1), dot12=v1.dot(v2); const invDen=1/(dot00*dot11-dot01*dot01); const u=(dot11*dot02-dot01*dot12)*invDen, v=(dot00*dot12-dot01*dot02)*invDen; return (u>=0)&&(v>=0)&&((u+v)<=1); }
+    function distPointToSegment(p,a,b){ const ap=p5.Vector.sub(p,a), ab=p5.Vector.sub(b,a); const t=constrain(ap.dot(ab)/ab.dot(ab),0,1); const q=createVector(a.x+ab.x*t, a.y+ab.y*t); return p5.Vector.dist(p,q); }
+    function closestPointOnPolygon(p,verts){ let bestQ=verts[0], bestD=Infinity; for(let i=0;i<verts.length;i++){ const a=verts[i], b=verts[(i+1)%verts.length]; const ap=p5.Vector.sub(p,a), ab=p5.Vector.sub(b,a); const t=constrain(ap.dot(ab)/ab.dot(ab),0,1); const q=createVector(a.x+ab.x*t, a.y+ab.y*t); const d=p5.Vector.dist(p,q); if(d<bestD){ bestD=d; bestQ=q; } } const centroid=createVector(0,0), dir=p5.Vector.sub(centroid,bestQ).setMag(0.5); return p5.Vector.add(bestQ,dir); }
+
+    // H-shape helpers
+    function pointInRect(p,r){ return Math.abs(p.x - r.cx) <= r.hw && Math.abs(p.y - r.cy) <= r.hh; }
+    function clampToRect(p,r){ const cx = constrain(p.x, r.cx - r.hw + 0.5, r.cx + r.hw - 0.5); const cy = constrain(p.y, r.cy - r.hh + 0.5, r.cy + r.hh - 0.5); return createVector(cx, cy); }
+    function pointInH(p){ const rects = hRects(); for (const r of rects) { if (pointInRect(p, r)) return true; } return false; }
+    function distToRectEdge(p, r){ const dx = r.hw - Math.abs(p.x - r.cx); const dy = r.hh - Math.abs(p.y - r.cy); return Math.min(dx, dy); }
+    function hRects(){ const Rw=ARENA_RADIUS, Rh=ARENA_RADIUS; return [ {cx:-Rw*0.7, cy:0, hw: Rw*0.3, hh: Rh}, {cx: Rw*0.7, cy:0, hw: Rw*0.3, hh: Rh}, {cx:0, cy:0, hw: Rw, hh: Rh*0.2} ]; }
+
+    // === Goals ===
+    function movingGoalPos(){ const radius=ARENA_RADIUS*0.6; return createVector(Math.cos(rotatingGoalAngle)*radius, Math.sin(rotatingGoalAngle)*radius); }
+    function spawnGoal(){ let r=(ARENA_RADIUS-600)*Math.sqrt(Math.random()); let a=random(TWO_PI); const pos=createVector(r*Math.cos(a), r*Math.sin(a)); goals.push({pos, born: millis(), ttl: 30000}); }
+    function scheduleNextGoal(){ nextGoalTime = millis() + BASE_GOAL_MS * goalSpawnFactor; }
+    function nearestGoal(pos){ let best=null, bestD2=Infinity; for(const g of goals){ const d2=p5.Vector.sub(g.pos,pos).magSq(); if(d2<bestD2){ bestD2=d2; best=g; } } return best; }
+
+    // === Keys ===
+    function keyPressed(){ if(key===' ') paused=!paused; if(key==='r'||key==='R') resetSimulation(); if(key==='e'||key==='E') exportHighRes(); if(key==='h'||key==='H'){ const ui=document.getElementById('ui'); ui.style.display=(ui.style.display==='none')?'block':'none'; } }
+    function resetSimulation(){ clearTrails(); rebuildBots(); goals=[]; scheduleNextGoal(); 
+  postSpawnSanity();
+}
+
+
+  // Live watcher: if inner shape spec (type/size) or arena shape changes, re-run safety for a while
+  (function(){
+    let specKey = 'none';
+    try {
+      const spec = (typeof innerShapeSpec === 'function') ? innerShapeSpec() : null;
+      const type = spec && spec.type ? spec.type : 'none';
+      const size = spec && spec.size ? spec.size : 0;
+      specKey = arenaShape + '|' + type + '|' + (Math.round(size*1000)/1000);
+    } catch(e) {}
+    if (typeof window.__lastInnerSpecKey === 'undefined') window.__lastInnerSpecKey = specKey;
+    if (window.__lastInnerSpecKey !== specKey) {
+      window.__lastInnerSpecKey = specKey;
+      // schedule extra sanitation frames after any change
+      window.__greenSanityFrames = Math.max(window.__greenSanityFrames||0, 90);
+
+      // Clear trails and reset bots on inner size/type change
+      try {
+        if (typeof clearTrails === 'function') clearTrails();
+        if (typeof rebuildBots === 'function') rebuildBots();
+        if (typeof postSpawnSanity === 'function') postSpawnSanity();
+        if (typeof goals !== 'undefined') goals = [];
+        if (typeof scheduleNextGoal === 'function') scheduleNextGoal();
+      } catch (e) {}
+    
+    }
+  })();
+    // === Export 10k PNG (no brightness boost; BLEND mode) ===
+    function exportHighRes(){ hiResTrails.blendMode(BLEND); hiResTrails.save('lld-bots-10k.png'); }
+
+    function updateStatus(){ statusEl.textContent = `Rule: ${labelForRule(currentRule)} | World: ${arenaShape.toUpperCase()} | Thickness: ${trailThickness.toFixed(1)}px | Opacity ×${trailAlphaMul.toFixed(2)} | Spin r=${SPINOUT.rate.toFixed(2)}/s | Spawn ×${goalSpawnFactor.toFixed(1)} | Inner ×${innerSizeFactor.toFixed(2)} | Limp ×${greenLimpScale.toFixed(2)} | Bias ${greenInstabilityBias.toFixed(2)}`; }
+    function updateVisibility(){ const probGroup=document.getElementById('probGroup'); const isProb=currentRule&&currentRule.startsWith('prob_'); if(probGroup) probGroup.style.display=isProb?'block':'none'; const showSpawn=(currentRule==='chase_goals'); const lbl=document.getElementById('spawnRowLabel'); const ctl=document.getElementById('spawnRowCtl'); if(lbl) lbl.style.display=showSpawn?'flex':'none'; if(ctl) ctl.style.display=showSpawn?'flex':'none'; const innerRow=document.getElementById('innerSizeRow'); const isInner = arenaShape && arenaShape.startsWith('square_inner_'); if(innerRow) innerRow.style.display = isInner ? 'flex' : 'none'; if(isInner) adjustInnerSliderMax(); }
+
+    // === Trail color helpers ===
+    function getTrailColor(kind){
+      const base = kind==='orange' ? BASE_ALPHA.orange : BASE_ALPHA.lime;
+      const a = constrain(Math.round(base * trailAlphaMul), 0, 255);
+      return (kind==='orange') ? color(255,140,0,a) : color(0,255,0,a);
+    }
+    function updateTrailColors(){ for (const b of bots){ b.stroke = getTrailColor(b.kind); } }
+
+    // === Misc Utilities ===
+    function labelForRule(v){ return { free:'Free roam', seek_center:'Seek center', avoid_center:'Orbit (avoid center)', seek_goal:'Seek rotating goal', chase_goals:'Chase random goals', seek_edge:'Seek outer edge', align_swarm:'Align (light)', repel_swarm:'Repel (light)', flock_balance:'Flocking (simple)', follow_leader:'Follow leader', prob_turn_bursts:'Prob: random turn bursts', prob_pause_dash:'Prob: pause & dash', prob_flip_goal:'Prob: flip goals', magnetic_swirl:'Magnetic swirl', predator_prey_a:'Predator–prey A', predator_prey_b:'Predator–prey B', entropy_drift:'Entropy drift', noise_field:'Noise field' }[v] || v; }
+    function angleDelta(from,to){ let d=to-from; d=(d+Math.PI)%(TWO_PI)-Math.PI; return d; }
+    function steerToward(current, desired, gain=1.0){ const d=angleDelta(current,desired); return constrain(d,-1,1)*gain; }
+
+    // Resize
+    function windowResized(){ resizeCanvas(windowWidth, windowHeight); scaleFactor = computeScale()*zoomFactor; bots.forEach(b=>b.prevPos=b.pos.copy()); }
+
+    // Mouse wheel zoom (no trail re-render)
+    function mouseWheel(event){
+      const prev = zoomFactor;
+      zoomFactor = constrain(zoomFactor - event.delta * 0.001, zoomMin, zoomMax);
+      if (zoomFactor !== prev) {
+        scaleFactor = computeScale() * zoomFactor;
+        for (const b of bots) b.prevPos = b.pos.copy(); // avoid jump chord after zoom
+      }
+      return false; // prevent page scroll while zooming
+    }
+
+    // Bind sliders + init
+    function bindSlider(id, setter, fmt, outId){ const el = document.getElementById(id); const out = document.getElementById(outId); const update = () => { setter(el.value); out.textContent = fmt(el.value); }; el.addEventListener('input', update); update(); }
+
+    function setup(){
+      createCanvas(windowWidth, windowHeight); pixelDensity(1); scaleFactor = computeScale()*zoomFactor;
+      // Offscreen buffers
+      // trails (screen buffer) no longer used for drawing; we render from hiResTrails
+      trails = createGraphics(width, height);
+      hiResTrails = createGraphics(HI_W, HI_H);
+      hiResTrails.background(0);
+      hiResTrails.blendMode(BLEND);
+
+      // UI hooks
+      ruleSelectEl = document.getElementById('ruleSelect');
+      shapeSelectEl = document.getElementById('shapeSelect');
+      statusEl = document.getElementById('status');
+      thicknessSliderEl = document.getElementById('thicknessSlider');
+      thicknessValueEl = document.getElementById('thicknessValue');
+
+      ruleSelectEl.addEventListener('change', () => { currentRule = ruleSelectEl.value; clearTrails(); rebuildBots(); goals=[]; scheduleNextGoal(); bots.forEach(b=>b.prevPos=b.pos.copy()); updateStatus(); updateVisibility(); });
+      shapeSelectEl.addEventListener('change', () => { arenaShape = shapeSelectEl.value; clearTrails(); rebuildBots(); bots.forEach(b=>b.prevPos=b.pos.copy()); updateStatus(); updateVisibility(); });
+      document.getElementById('clearBtn').addEventListener('click', () => { clearTrails(); bots.forEach(b => b.prevPos = b.pos.copy()); });
+      thicknessSliderEl.addEventListener('input', () => { trailThickness = parseFloat(thicknessSliderEl.value); thicknessValueEl.textContent = trailThickness.toFixed(1) + ' px'; updateStatus(); });
+
+      // Transparency slider
+      const alphaEl = document.getElementById('alphaSlider');
+      const alphaOut = document.getElementById('alphaValue');
+      const alphaUpdate = () => { trailAlphaMul = parseFloat(alphaEl.value); alphaOut.textContent = trailAlphaMul.toFixed(2)+'×'; updateTrailColors(); updateStatus(); };
+      alphaEl.addEventListener('input', alphaUpdate); alphaUpdate();
+
+      // Spinout sliders
+      const spinRateEl = document.getElementById('spinRate');
+      const spinRateV  = document.getElementById('spinRateV');
+      const spinDurEl  = document.getElementById('spinDur');
+      const spinDurV   = document.getElementById('spinDurV');
+      const spinMagEl  = document.getElementById('spinMag');
+      const spinMagV   = document.getElementById('spinMagV');
+      const spinUpdate = () => {
+        SPINOUT.rate = parseFloat(spinRateEl.value);
+        spinRateV.textContent = SPINOUT.rate.toFixed(2);
+        const d = parseFloat(spinDurEl.value);
+        SPINOUT.durMin = d * 0.5; SPINOUT.durMax = d; spinDurV.textContent = d.toFixed(1);
+        const m = parseFloat(spinMagEl.value);
+        SPINOUT.magMin = m * 0.6; SPINOUT.magMax = m; spinMagV.textContent = m.toFixed(1);
+        updateStatus();
+      };
+      spinRateEl.addEventListener('input', spinUpdate);
+      spinDurEl.addEventListener('input', spinUpdate);
+      spinMagEl.addEventListener('input', spinUpdate);
+      spinUpdate();
+
+      // Prob sliders
+      bindSlider('burstRate', v => prob.burstRate = parseFloat(v), x=>x, 'burstRateV');
+      bindSlider('burstMag',  v => prob.burstMagMax = parseFloat(v), x=>parseFloat(x).toFixed(1), 'burstMagV');
+      bindSlider('burstDur',  v => prob.burstDurMax = parseFloat(v), x=>parseFloat(x).toFixed(2), 'burstDurV');
+      bindSlider('pauseRate', v => prob.pauseRate = parseFloat(v), x=>x, 'pauseRateV');
+      bindSlider('pauseDur',  v => prob.pauseDurMax = parseFloat(v), x=>parseFloat(x).toFixed(2), 'pauseDurV');
+      bindSlider('dashRate',  v => prob.dashRate = parseFloat(v), x=>x, 'dashRateV');
+      bindSlider('dashDur',   v => prob.dashDurMax = parseFloat(v), x=>parseFloat(x).toFixed(2), 'dashDurV');
+      bindSlider('dashMul',   v => prob.dashMul = parseFloat(v), x=>parseFloat(x).toFixed(1), 'dashMulV');
+      bindSlider('flipRate',  v => prob.flipRate = parseFloat(v), x=>x, 'flipRateV');
+      bindSlider('spawnFactor', v => { goalSpawnFactor = parseFloat(v); }, x=>parseFloat(x).toFixed(1)+'×', 'spawnFactorV');
+
+      // Inner size slider binding
+      const innerEl = document.getElementById('innerSize');
+      const innerOut = document.getElementById('innerSizeV');
+      const innerUpdate = () => { innerSizeFactor = parseFloat(innerEl.value); innerOut.textContent = innerSizeFactor.toFixed(2)+'×'; };
+      innerEl.addEventListener('input', innerUpdate); innerUpdate();
+
+      // Limping & instability sliders
+      const limpEl = document.getElementById('limpSlider');
+      const limpOut = document.getElementById('limpValue');
+      const limpUpdate = () => { greenLimpScale = parseFloat(limpEl.value); limpOut.textContent = greenLimpScale.toFixed(2)+'×'; clearTrails(); rebuildBots(); };
+      limpEl.addEventListener('input', limpUpdate); limpUpdate();
+
+      const instEl = document.getElementById('instabSlider');
+      const instOut = document.getElementById('instabValue');
+      const instUpdate = () => { greenInstabilityBias = parseFloat(instEl.value); const dir = greenInstabilityBias>0?'right':greenInstabilityBias<0?'left':'neutral'; instOut.textContent = `${greenInstabilityBias.toFixed(2)} (${dir})`; clearTrails(); rebuildBots(); };
+      instEl.addEventListener('input', instUpdate); instUpdate();
+
+      updateStatus(); updateVisibility(); rebuildBots(); frameRate(60); scheduleNextGoal();
+    }
+
+    // Adjust inner size slider max and clamp value
+    function adjustInnerSliderMax(){
+      const innerEl = document.getElementById('innerSize');
+      const spec = innerShapeSpec();
+      if (!innerEl || !spec) return;
+      const maxFactor = Math.max(1, 1 / spec.base);
+      innerEl.max = String(maxFactor.toFixed(2));
+      let currentVal = parseFloat(innerEl.value);
+      if (currentVal > maxFactor) currentVal = maxFactor;
+      if (currentVal < parseFloat(innerEl.min)) currentVal = parseFloat(innerEl.min);
+      innerEl.value = currentVal.toFixed(2);
+      innerSizeFactor = currentVal;
+      document.getElementById('innerSizeV').textContent = currentVal.toFixed(2)+'×';
+    }
+
+    // === Goals ===
+    function movingGoalPos(){ const radius=ARENA_RADIUS*0.6; return createVector(Math.cos(rotatingGoalAngle)*radius, Math.sin(rotatingGoalAngle)*radius); }
+    function spawnGoal(){ let r=(ARENA_RADIUS-600)*Math.sqrt(Math.random()); let a=random(TWO_PI); const pos=createVector(r*Math.cos(a), r*Math.sin(a)); goals.push({pos, born: millis(), ttl: 30000}); }
+    function scheduleNextGoal(){ nextGoalTime = millis() + BASE_GOAL_MS * goalSpawnFactor; }
+    function nearestGoal(pos){ let best=null, bestD2=Infinity; for(const g of goals){ const d2=p5.Vector.sub(g.pos,pos).magSq(); if(d2<bestD2){ bestD2=d2; best=g; } } return best; }
+
+    // Draw the on-screen view by sampling/scaling the 10k trail buffer (centered, no drift)
+    function drawViewportFromHiRes(){
+      push();
+      translate(width/2, height/2);
+      imageMode(CENTER);
+      const s = scaleFactor / HI_SCALE; // screen px per hi-res px
+      const dw = HI_W * s;
+      const dh = HI_H * s;
+      image(hiResTrails, 0, 0, dw, dh);
+      pop();
+    }
+
+    // Init dropdown readability tweaks
+    document.addEventListener('DOMContentLoaded', () => {
+      const selects = document.querySelectorAll('select');
+      selects.forEach(sel => { sel.style.background = '#1f2329'; sel.style.color = '#f5f5f5'; sel.style.fontWeight = '500'; });
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,1080 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Four-View Wireframe City Bots — Full Clean Build (moving by default)</title>
+<link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+<style>
+  :root { --bg:#0b0b0b; --fg:#ddd; --card:#101010; --line:#333; --accent:#7CFF6B; --accent2:#FFA84B; }
+  html,body{margin:0;background:var(--bg);color:var(--fg);font:12px ui-monospace,Menlo,Consolas,monospace;overflow:hidden}
+  #ui{position:fixed;top:8px;left:8px;right:8px;display:flex;gap:10px;align-items:center;z-index:10;pointer-events:auto}
+  .badge{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:4px 8px}
+  .badge[role=button]{cursor:pointer}
+  input[type=number]{width:60px;background:#0d0d0d;border:1px solid #444;color:#eee;border-radius:6px;padding:3px 6px}
+  #legend{position:fixed;left:10px;bottom:10px;background:#111a;border:1px solid #333;border-radius:10px;padding:8px 10px;display:none;z-index:6}
+  #dslModal{position:fixed;inset:0;background:#0008;display:none;align-items:center;justify-content:center;z-index:50}
+  #dslCard{background:#0e0e0e;border:1px solid #333;border-radius:12px;max-width:860px;width:92%;padding:14px}
+  #dslText{width:100%;height:220px;background:#0a0a0a;border:1px solid #444;color:#e8e8e8;border-radius:8px;padding:8px}
+  #dslActions{margin-top:8px;display:flex;gap:8px;justify-content:flex-end}
+  .btn{background:#171717;border:1px solid #444;border-radius:8px;padding:6px 10px;color:#e6e6e6;cursor:pointer}
+  .btn:hover{background:#1d1d1d}
+  #dslError{color:#ff8a8a;min-height:1em;margin-top:4px}
+</style>
+</head>
+<body>
+  <div id="ui">
+    <div class="badge">Views: ① Iso • ② Top-down • ③ Follow G1 • ④ Follow O1</div>
+    <div class="badge">Keys: R new • T p/1×/10× • D DSL • L legend • M 3D/2D</div>
+    <div id="timeBadge" class="badge" role="button" title="Toggle time ⏸/1×/10× [T]">Time ×1</div>
+    <div id="modeBadge" class="badge" role="button" title="Toggle 3D/2D [M]">Mode: 3D</div>
+    <div class="badge">Green bots <input id="numGreen" type="number" min="0" step="1" value="1"></div>
+    <div class="badge">Orange bots <input id="numOrange" type="number" min="0" step="1" value="1"></div>
+      <div id="importBtn" class="badge" role="button" title="Import bot JSON">Import bot</div>
+    <input id="botFile" type="file" accept="application/json,.json" style="display:none">
+  </div>
+
+  <div id="legend">
+    <div>Legend (L to toggle)</div>
+    <div>□ Buildings (wireframe) + 10% surfaces (3D only)</div>
+    <div>— Sky bridges (3D only) • ┄ Streets</div>
+    <div><span style="color:#7CFF6B">● Green</span> ramps-only, asymmetric, 0.9× speed, rests 20s</div>
+    <div><span style="color:#FFA84B">● Orange</span> fastest path, rests 15s</div>
+  </div>
+
+  <!-- DSL modal -->
+  <div id="dslModal">
+    <div id="dslCard">
+      <div style="font-weight:600;margin-bottom:6px">DSL (press D to toggle)</div>
+      <textarea id="dslText" spellcheck="false"># Example:
+splitBorder: on
+followRadius: 1600
+green.count: 1
+orange.count: 1
+      </textarea>
+      <div id="dslError"></div>
+      <div id="dslActions">
+        <button class="btn" id="dslApply">Apply</button>
+        <button class="btn" id="dslClose">Close</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+// ============================
+// Constants & Config
+// ============================
+const WORLD_SIZE=10000, VOXEL=100, BUILDING_GRID=10, CELL_SIZE=WORLD_SIZE/BUILDING_GRID;
+let MIN_FLOORS=5, MAX_FLOORS=20, SKY_BRIDGE_CHANCE=0.6, BUILDING_CHANCE=0.55, PARK_CHANCE=0.20;
+const BOT_SPEED=180, TURN_RATE=1.5, FRAME_RATE=60;
+
+// Time (T cycles ⏸/×1/×10)
+let TIME_OPTIONS=[1,10,0], _timeIdx=0, TIME_SCALE=TIME_OPTIONS[_timeIdx], paused=(TIME_SCALE===0);
+
+// Modes
+let MODE_2D=false;
+
+// Grids for 2D mode
+const GRID_N = Math.floor(WORLD_SIZE/VOXEL);
+let gridBlocked=null, gridTexture=null;
+
+// Trails
+const TRAIL_MIN_DIST=VOXEL*0.25, TRAIL_MAX_POINTS=12000;
+let FOLLOW_R=1600;
+
+// DSL exposed toggles
+let SPLIT_BORDER_ON=true;
+
+// ============================
+// Textures & Accessibility
+// ============================
+const TEXTURES=[
+  {id:'polished_concrete',score:1.00},
+  {id:'sealed_wood',score:0.95},
+  {id:'tile',score:0.94},
+  {id:'short_carpet',score:0.92},
+  {id:'steel_grate',score:0.90},
+  {id:'asphalt',score:0.95},
+  {id:'pavers',score:0.90},
+  {id:'rubber',score:0.97},
+  {id:'packed_gravel',score:0.82},
+  {id:'grass',score:0.75},
+  {id:'sand',score:0.60},
+  {id:'ice',score:0.50}
+];
+const TEXTURE_BY_ID=TEXTURES.reduce((m,t)=>{m[t.id]=t;return m;},{});
+function pickTexture(){ return TEXTURES[(Math.random()*TEXTURES.length)|0].id; }
+
+// ============================
+// Helpers
+// ============================
+function gridToWorld(i,j){ return {x:(i+0.5)*CELL_SIZE-WORLD_SIZE/2, y:0, z:(j+0.5)*CELL_SIZE-WORLD_SIZE/2}; }
+function randRange(a,b){ return a+Math.random()*(b-a); }
+function angleDiff(a,b){ let d=a-b; while(d>Math.PI)d-=2*Math.PI; while(d<-Math.PI)d+=2*Math.PI; return d; }
+function hexToRGB(h){ return {r:parseInt(h.slice(1,3),16), g:parseInt(h.slice(3,5),16), b:parseInt(h.slice(5,7),16)}; }
+function updateTimeBadge(){ const el=document.getElementById('timeBadge'); if(!el) return; el.textContent=(TIME_SCALE===0?'Time ⏸':'Time ×'+TIME_SCALE); }
+function toggleTimeScale(){ _timeIdx=(_timeIdx+1)%TIME_OPTIONS.length; TIME_SCALE=TIME_OPTIONS[_timeIdx]; paused=(TIME_SCALE===0); updateTimeBadge(); }
+function modeUpdateBadge(){ const mb=document.getElementById('modeBadge'); if(mb){ mb.textContent='Mode: '+(MODE_2D?'2D':'3D'); } }
+function toggleMode2D(){ MODE_2D=!MODE_2D; modeUpdateBadge(); newScenario(); }
+
+// ============================
+// City structures
+// ============================
+function Building(i,j,floors,footprint){
+  this.i=i; this.j=j; this.floors=floors; this.footprint=footprint;
+  const c=gridToWorld(i,j); this.x=c.x; this.y=0; this.z=c.z;
+  this.id='B_'+i+'_'+j; this.rampEdge=['N','S','E','W'][(Math.random()*4)|0];
+  this.floorTextures=new Array(floors);
+}
+Building.prototype.centerOfFloor=function(f){ return {x:this.x,y:f*VOXEL,z:this.z}; };
+Building.prototype.connectorPos=function(edge,f){
+  const w=this.footprint.w, d=this.footprint.d, y=f*VOXEL;
+  let x=this.x, z=this.z;
+  if(edge==='N') z-=d/2; if(edge==='S') z+=d/2; if(edge==='W') x-=w/2; if(edge==='E') x+=w/2;
+  return {x,y,z};
+};
+
+function Bridge(b1,b2,floor,edge1,edge2){
+  this.b1=b1; this.b2=b2; this.floor=floor; this.edge1=edge1; this.edge2=edge2; this.texture='steel_grate';
+  this.p1=b1.connectorPos(edge1,floor); this.p2=b2.connectorPos(edge2,floor);
+}
+
+function NavigationGraph(){ this.nodes=new Map(); this.edges=new Map(); }
+NavigationGraph.prototype.key=function(p){ return Math.round(p.x)+'|'+Math.round(p.y)+'|'+Math.round(p.z); };
+NavigationGraph.prototype.addNode=function(p){ const k=this.key(p); if(!this.nodes.has(k)) this.nodes.set(k,{pos:{x:p.x,y:p.y,z:p.z}}); return k; };
+NavigationGraph.prototype._push=function(ka,kb,cost,type){ if(!this.edges.has(ka)) this.edges.set(ka,[]); this.edges.get(ka).push({to:kb,cost,type}); };
+NavigationGraph.prototype.addEdge=function(a,b,type){
+  const ka=this.addNode(a), kb=this.addNode(b);
+  const dx=a.x-b.x, dy=a.y-b.y, dz=a.z-b.z;
+  let cost=Math.hypot(dx,dz)+Math.abs(dy);
+  if(type==='stairs') cost*=0.85;
+  if(type==='ramp') cost*=1.10;
+  this._push(ka,kb,cost,type); this._push(kb,ka,cost,type);
+};
+NavigationGraph.prototype.neighbors=function(k){ return this.edges.get(k)||[]; };
+NavigationGraph.prototype.getEdgeType=function(a,b){
+  const ka=this.key(a), kb=this.key(b), ns=this.edges.get(ka)||[];
+  for(let i=0;i<ns.length;i++){ if(ns[i].to===kb) return ns[i].type; } return null;
+};
+NavigationGraph.prototype.aStar=function(startPos, goalPos, filter){
+  // Simple A* on graph nodes
+  const start=this.key(startPos), goal=this.key(goalPos);
+  const h=(k)=>{ const p=this.nodes.get(k).pos, g=this.nodes.get(goal).pos; return Math.hypot(p.x-g.x, p.z-g.z)+Math.abs(p.y-g.y); };
+  const open=[start], openSet=new Set([start]), came=new Map(), gScore=new Map([[start,0]]), fScore=new Map([[start,h(start)]]);
+  while(open.length){
+    // get lowest f
+    let bi=0, bf=fScore.get(open[0])??Infinity; for(let i=1;i<open.length;i++){ const f=fScore.get(open[i])??Infinity; if(f<bf){bf=f; bi=i;} }
+    const current=open.splice(bi,1)[0]; openSet.delete(current);
+    if(current===goal){
+      // reconstruct
+      const path=[]; let ck=current; path.push(this.nodes.get(ck).pos);
+      while(came.has(ck)){ ck=came.get(ck); path.push(this.nodes.get(ck).pos); }
+      path.reverse(); return path;
+    }
+    const ns=this.neighbors(current);
+    for(let i=0;i<ns.length;i++){
+      const e=ns[i]; if(filter==='rampsOnly' && e.type!=='ramp' && e.type!=='bridge') continue;
+      const tentative=(gScore.get(current)??Infinity)+e.cost;
+      const old=gScore.get(e.to);
+      if(old===undefined || tentative<old){
+        came.set(e.to,current); gScore.set(e.to,tentative); fScore.set(e.to,tentative+h(e.to));
+        if(!openSet.has(e.to)){ open.push(e.to); openSet.add(e.to); }
+      }
+    }
+  }
+  return null;
+};
+
+// Spatial index for nearest
+function GraphSpatialIndex(cell){ this.cell=cell; this.map=new Map(); }
+GraphSpatialIndex.prototype._key=function(ix,iz){ return ix+'|'+iz; };
+GraphSpatialIndex.prototype.insert=function(pos,key){
+  const ix=Math.floor((pos.x+WORLD_SIZE/2)/this.cell);
+  const iz=Math.floor((pos.z+WORLD_SIZE/2)/this.cell);
+  const k=this._key(ix,iz);
+  let arr=this.map.get(k); if(!arr){arr=[]; this.map.set(k,arr);} arr.push(key);
+};
+GraphSpatialIndex.prototype.buildFromGraph=function(graph){
+  this.map.clear();
+  for(const [k,n] of graph.nodes.entries()) this.insert(n.pos,k);
+};
+GraphSpatialIndex.prototype.nearest=function(p,graph){
+  const ix=Math.floor((p.x+WORLD_SIZE/2)/this.cell);
+  const iz=Math.floor((p.z+WORLD_SIZE/2)/this.cell);
+  let bestK=null,bestD=Infinity;
+  const tryCell=(cx,cz)=>{
+    const arr=this.map.get(this._key(cx,cz)); if(!arr) return;
+    for(let i=0;i<arr.length;i++){ const k=arr[i], n=graph.nodes.get(k).pos;
+      const d=(p.x-n.x)**2+(p.y-n.y)**2+(p.z-n.z)**2; if(d<bestD){bestD=d; bestK=k;}
+    }
+  };
+  tryCell(ix,iz);
+  for(let r=1;r<=8 && !bestK;r++){
+    for(let dx=-r;dx<=r;dx++){ tryCell(ix+dx,iz-r); tryCell(ix+dx,iz+r); }
+    for(let dz=-r+1;dz<=r-1;dz++){ tryCell(ix-r,iz+dz); tryCell(ix+r,iz+dz); }
+  }
+  if(!bestK){
+    for(const [k,pos] of graph.nodes.entries()){ const n=pos.pos||pos; const d=(p.x-n.x)**2+(p.y-n.y)**2+(p.z-n.z)**2; if(d<bestD){bestD=d; bestK=k;} }
+  }
+  return bestK ? graph.nodes.get(bestK).pos : p;
+};
+
+// >>> Missing helper kept here <<<
+function nearestGraphPos(p){
+  if(gSpatial && graph && graph.nodes && graph.nodes.size>0){
+    try { return gSpatial.nearest(p, graph); } catch(e){ /* fall through */ }
+  }
+  // Fallback: linear scan
+  let best=null, bestD=Infinity;
+  if(graph && graph.nodes){
+    for(const n of graph.nodes.values()){
+      const pos=n.pos||n;
+      const dx=p.x-pos.x, dy=p.y-pos.y, dz=p.z-pos.z;
+      const d=dx*dx+dy*dy+dz*dz;
+      if(d<bestD){ bestD=d; best=pos; }
+    }
+  }
+  return best||{x:p.x,y:p.y,z:p.z};
+}
+
+// ============================
+// City generation
+// ============================
+let buildings=[], bridges=[], streets=[], graph=null, gSpatial=new GraphSpatialIndex(VOXEL*6);
+let cityAccessibility=0;
+
+function generateCity(){
+  buildings.length=0; bridges.length=0; streets.length=0; graph=new NavigationGraph();
+  // Place buildings
+  for(let i=0;i<BUILDING_GRID;i++){
+    for(let j=0;j<BUILDING_GRID;j++){
+      if(Math.random()>BUILDING_CHANCE) continue;
+      if(Math.random()<PARK_CHANCE) continue;
+      const floors=Math.floor(randRange(MIN_FLOORS,MAX_FLOORS));
+      const maxFoot=CELL_SIZE*0.7, minFoot=CELL_SIZE*0.35;
+      const w=Math.floor(randRange(minFoot,maxFoot)/VOXEL)*VOXEL;
+      const d=Math.floor(randRange(minFoot,maxFoot)/VOXEL)*VOXEL;
+      buildings.push(new Building(i,j,floors,{w,d}));
+    }
+  }
+  // Internal vertical connectivity
+  for(const b of buildings){
+    for(let f=0; f<b.floors; f++){
+      const center=b.centerOfFloor(f); graph.addNode(center);
+      if(f<b.floors-1){
+        const up=b.centerOfFloor(f+1);
+        graph.addEdge(center,up,'stairs');
+        const rp0=b.connectorPos(b.rampEdge,f), rp1=b.connectorPos(b.rampEdge,f+1);
+        graph.addNode(rp0); graph.addNode(rp1);
+        graph.addEdge(center,rp0,'ramp'); graph.addEdge(rp0,rp1,'ramp'); graph.addEdge(rp1,up,'ramp');
+      }
+      if(f===0){ const entry=b.connectorPos('N',0); graph.addNode(entry); graph.addEdge(center,entry,'ramp'); }
+    }
+  }
+  // Ground streets (grid of cell centers)
+  const streetNode=Array.from({length:BUILDING_GRID},()=>Array(BUILDING_GRID).fill(null));
+  for(let i=0;i<BUILDING_GRID;i++) for(let j=0;j<BUILDING_GRID;j++){ const c=gridToWorld(i,j); streetNode[i][j]=c; graph.addNode(c); }
+  for(let i=0;i<BUILDING_GRID;i++) for(let j=0;j<BUILDING_GRID;j++){
+    if(i+1<BUILDING_GRID){ const a=streetNode[i][j], b=streetNode[i+1][j]; graph.addEdge(a,b,'ramp'); streets.push({a,b,texture:'asphalt'}); }
+    if(j+1<BUILDING_GRID){ const a=streetNode[i][j], b=streetNode[i][j+1]; graph.addEdge(a,b,'ramp'); streets.push({a,b,texture:'asphalt'}); }
+  }
+  for(const b of buildings){ const entry=b.connectorPos('N',0), node=streetNode[b.i][b.j]; if(node){ graph.addEdge(entry,node,'ramp'); streets.push({a:entry,b:node,texture:'asphalt'}); } }
+  // Probabilistic bridges to neighbors + ensure every building has 1
+  const byCell=new Map(); for(const b of buildings){ byCell.set(b.i+'|'+b.j,b); }
+  const dirs=[[1,0],[0,1],[-1,0],[0,-1]];
+  function edgePair(dx,dz){ if(Math.abs(dx)>=Math.abs(dz)) return dx>0?['E','W']:['W','E']; else return dz>0?['S','N']:['N','S']; }
+  for(const b of buildings){
+    for(const d of dirs){
+      const nb=byCell.get((b.i+d[0])+'|'+(b.j+d[1])); if(!nb) continue;
+      if(Math.random()>SKY_BRIDGE_CHANCE) continue;
+      const floor=Math.floor(Math.min(b.floors,nb.floors)/2);
+      const ep=edgePair(d[0],d[1]); const e1=ep[0], e2=ep[1];
+      const p1=b.connectorPos(e1,floor), p2=nb.connectorPos(e2,floor);
+      const br=new Bridge(b,nb,floor,e1,e2); bridges.push(br);
+      graph.addNode(p1); graph.addNode(p2);
+      graph.addEdge(p1,p2,'bridge');
+      graph.addEdge(p1,b.centerOfFloor(floor),'ramp');
+      graph.addEdge(p2,nb.centerOfFloor(floor),'ramp');
+    }
+  }
+  for(const b of buildings){
+    let has=false;
+    for(const br of bridges){ if(br.b1===b || br.b2===b){ has=true; break; } }
+    if(has) continue;
+    let best=null,bestD=Infinity;
+    for(const other of buildings){ if(other===b) continue; const d=(other.x-b.x)**2+(other.z-b.z)**2; if(d<bestD){bestD=d; best=other;} }
+    if(best){
+      const dx=best.i-b.i, dz=best.j-b.j, ep=edgePair(dx,dz); const e1b=ep[0], e2b=ep[1];
+      const fBest=Math.floor(Math.min(b.floors,best.floors)/2);
+      const pb1=b.connectorPos(e1b,fBest), pb2=best.connectorPos(e2b,fBest);
+      const br2=new Bridge(b,best,fBest,e1b,e2b); bridges.push(br2);
+      graph.addNode(pb1); graph.addNode(pb2);
+      graph.addEdge(pb1,pb2,'bridge');
+      graph.addEdge(pb1,b.centerOfFloor(fBest),'ramp');
+      graph.addEdge(pb2,best.centerOfFloor(fBest),'ramp');
+    }
+  }
+  gSpatial.buildFromGraph(graph);
+}
+
+function assignFloorTexturesAndAccessibility(){
+  for(const b of buildings) for(let f=0; f<b.floors; f++){ if(!b.floorTextures[f]) b.floorTextures[f]=pickTexture(); }
+  let areaSum=0, weighted=0;
+  const add=(area,texId,bonus=0)=>{ let sc=(TEXTURE_BY_ID[texId]?.score ?? 0.8)+bonus; if(sc<0) sc=0; if(sc>1.1) sc=1.1; weighted+=area*sc; areaSum+=area; };
+  for(const b of buildings){ const area=b.footprint.w*b.footprint.d; for(let f=0; f<b.floors; f++){ add(area,b.floorTextures[f], f===0?0.05:0); } }
+  const streetW=VOXEL*2; for(const e of streets){ const len=Math.hypot(e.a.x-e.b.x,e.a.z-e.b.z); add(len*streetW,e.texture||'asphalt',0.03); }
+  const bridgeW=VOXEL*1.5; for(const br of bridges){ const len=Math.hypot(br.p1.x-br.p2.x, br.p1.z-br.p2.z); add(len*bridgeW, br.texture||'steel_grate',0.05); }
+  cityAccessibility=Math.round((areaSum?weighted/areaSum:0)*100);
+}
+
+// 2D fields
+function alloc2DGrids(){
+  const n=GRID_N; gridBlocked=new Array(n); gridTexture=new Array(n);
+  for(let i=0;i<n;i++){ gridBlocked[i]=new Array(n); gridTexture[i]=new Array(n); }
+}
+function build2DFields(){
+  alloc2DGrids();
+  for(let i=0;i<GRID_N;i++){ for(let j=0;j<GRID_N;j++){ gridTexture[i][j]=pickTexture(); gridBlocked[i][j]=false; } }
+  for(const b of buildings){
+    const w=b.footprint.w, d=b.footprint.d, x=b.x, z=b.z;
+    const minI=Math.max(0,Math.min(GRID_N-1,Math.floor((x-w/2+WORLD_SIZE/2)/VOXEL)));
+    const maxI=Math.max(0,Math.min(GRID_N-1,Math.floor((x+w/2+WORLD_SIZE/2)/VOXEL)));
+    const minJ=Math.max(0,Math.min(GRID_N-1,Math.floor((z-d/2+WORLD_SIZE/2)/VOXEL)));
+    const maxJ=Math.max(0,Math.min(GRID_N-1,Math.floor((z+d/2+WORLD_SIZE/2)/VOXEL)));
+    for(let ii=minI;ii<=maxI;ii++) for(let jj=minJ;jj<=maxJ;jj++) gridBlocked[ii][jj]=true;
+  }
+}
+function worldToCell(x,z){
+  const i=Math.max(0,Math.min(GRID_N-1,Math.floor((x+WORLD_SIZE/2)/VOXEL)));
+  const j=Math.max(0,Math.min(GRID_N-1,Math.floor((z+WORLD_SIZE/2)/VOXEL)));
+  return {i,j};
+}
+function cellToWorld(i,j){ return {x:(i+0.5)*VOXEL-WORLD_SIZE/2, y:0, z:(j+0.5)*VOXEL-WORLD_SIZE/2}; }
+
+// ============================
+// 2D A* (green weighted by texture; orange can cross buildings)
+// ============================
+function aStar2DWeighted(startIJ, goalIJ, forGreen){
+  const si=startIJ.i, sj=startIJ.j, gi=goalIJ.i, gj=goalIJ.j;
+  const key=(i,j)=>i+'|'+j;
+  const open=[], openMap={}, gScore={}, fScore={}, came={};
+  const sk=key(si,sj);
+  gScore[sk]=0; fScore[sk]=Math.hypot(gi-si, gj-sj);
+  open.push({k:sk,i:si,j:sj,f:fScore[sk]}); openMap[sk]=true;
+  const stepFactor=(i,j)=>{
+    const tex=TEXTURE_BY_ID[gridTexture[i][j]]; const sc=Math.max(0.2, Math.min(1.0, tex?tex.score:0.8));
+    return forGreen ? 1.0/sc : 1.0; // orange unaffected
+  };
+  const blocked=(i,j)=> forGreen ? gridBlocked[i][j] : false; // orange can pass buildings
+  const popLowest=()=>{ let bi=0,best=open[0].f; for(let q=1;q<open.length;q++) if(open[q].f<best){bi=q; best=open[q].f;} const it=open.splice(bi,1)[0]; delete openMap[it.k]; return it; };
+  let visited=0, limit=GRID_N*GRID_N*6;
+  while(open.length && visited<limit){
+    const cur=popLowest(); visited++;
+    if(cur.i===gi && cur.j===gj){
+      const path=[]; let ck=key(cur.i,cur.j);
+      while(ck){ const [ii,jj]=ck.split('|').map(x=>parseInt(x,10)); path.push(cellToWorld(ii,jj)); ck=came[ck]; }
+      path.reverse(); return path;
+    }
+    for(let di=-1;di<=1;di++) for(let dj=-1;dj<=1;dj++){
+      if(di===0&&dj===0) continue;
+      const ni=cur.i+di, nj=cur.j+dj;
+      if(ni<0||nj<0||ni>=GRID_N||nj>=GRID_N) continue;
+      if(blocked(ni,nj)) continue;
+      const nk=key(ni,nj);
+      const base=Math.hypot(di,dj), w=stepFactor(ni,nj);
+      const gs=(gScore[cur.k]??Infinity)+base*w;
+      if(gScore[nk]===undefined || gs<gScore[nk]){
+        came[nk]=cur.k; gScore[nk]=gs; fScore[nk]=gs+Math.hypot(gi-ni, gj-nj);
+        if(!openMap[nk]){ open.push({k:nk,i:ni,j:nj,f:fScore[nk]}); openMap[nk]=true; }
+      }
+    }
+  }
+  return null;
+}
+
+// ============================
+// Bots & gaits
+// ============================
+function Bot(color){
+  this.color=color; this.rgb=hexToRGB(color); this.type='bot';
+  this.pos={x:0,y:0,z:0}; this.dir={x:1,y:0,z:0};
+  this.speed=BOT_SPEED; this.turnRate=TURN_RATE; this.height=VOXEL*0.6;
+  this.path=[]; this.pathIndex=0; this.segTypes=[];
+  this._lx=Infinity; this._ly=Infinity; this._lz=Infinity; this._stuckTime=0;
+  this.camPhase=0; this.camY=0;
+  this.fatigue=0; this.fatigueRate=1/300; this.isResting=false; this.restTimer=0; this.restDuration=15;
+  this.trail=[];
+}
+Bot.prototype.setStart=function(p){ this.pos={x:p.x,y:p.y,z:p.z}; this._lx=p.x; this._ly=p.y; this._lz=p.z; this._stuckTime=0; };
+Bot.prototype.setPath=function(path, segTypes){ this.path=path||[]; this.segTypes=segTypes||[]; this.pathIndex=0; this._stuckTime=0; };
+Bot.prototype.currentTarget=function(){ return this.path[this.pathIndex]||null; };
+Bot.prototype.atTarget=function(t){ const dx=this.pos.x-t.x, dy=this.pos.y-t.y, dz=this.pos.z-t.z; return (dx*dx+dy*dy+dz*dz) < (VOXEL*VOXEL*0.25); };
+Bot.prototype.update=function(dt){
+  if(this.isResting){ this.restTimer-=dt; this.camPhase+=dt*0.6; this.camY=Math.sin(this.camPhase)*VOXEL*0.01; if(this.restTimer<=0){ this.isResting=false; this.fatigue=0; } return; }
+  const t=this.currentTarget(); if(!t) return;
+  let dx=t.x-this.pos.x, dz=t.z-this.pos.z;
+  const distXZ=Math.max(0.001, Math.hypot(dx,dz));
+  const desired=Math.atan2(dz,dx);
+  const current=Math.atan2(this.dir.z,this.dir.x);
+  let dtheta=angleDiff(desired,current);
+  const maxTurn=this.turnRate*dt; if(dtheta>maxTurn)dtheta=maxTurn; else if(dtheta<-maxTurn)dtheta=-maxTurn;
+  const newHeading=current+dtheta; let cosH=Math.cos(newHeading), sinH=Math.sin(newHeading);
+  this.dir.x=cosH; this.dir.z=sinH;
+  const arrive=Math.min(1, Math.max(0.3, distXZ/(VOXEL*2)));
+  const step=this.speed*dt*arrive;
+  this.pos.x+=cosH*step; this.pos.z+=sinH*step;
+  const ydiff=t.y-this.pos.y; const ystep=Math.min(Math.abs(ydiff), step*0.6); this.pos.y+=Math.sign(ydiff)*ystep;
+  if(this.atTarget(t)) this.pathIndex=Math.min(this.pathIndex+1, this.path.length);
+  if(MODE_2D){ this.pos.y=0; }
+  const moved=Math.hypot(this.pos.x-this._lx, this.pos.y-this._ly, this.pos.z-this._lz);
+  if(moved<1){ this._stuckTime+=dt; } else { this._stuckTime=0; this._lx=this.pos.x; this._ly=this.pos.y; this._lz=this.pos.z; }
+  if(this._stuckTime>2){ requestReplan(this); this._stuckTime=0; }
+  this.camPhase += (step/VOXEL)*2.5; this.camY = Math.sin(this.camPhase)*VOXEL*0.03;
+  const effort=0.6+0.4*arrive; this.fatigue += dt*this.fatigueRate*effort; if(this.fatigue>=1){ this.isResting=true; this.restTimer=this.restDuration*(0.9+Math.random()*0.2); }
+};
+
+const DEFAULT_GAIT_GREEN={
+  wobbleFreq:0.45, wobbleAmp:0.25, rollAmp:0.125, // 50% reduced roll default
+  speedBiasAmp:0.12, limpLatAmp:VOXEL*0.30, baseSpeedMul:0.90,
+  turnMul:0.75, turnBiasLeft:1.25, turnBiasRight:0.85,
+  texSpeedK:0.50, texTurnK:0.55, texWobbleK:1.0, texLateralK:1.0,
+  steerNoisePct:0.10
+};
+const DEFAULT_GAIT_ORANGE={ baseSpeedMul:1.05, turnMul:1.00 };
+
+function GreenBot(){ Bot.call(this,'#33FF33'); this.type='green'; this.gait=JSON.parse(JSON.stringify(DEFAULT_GAIT_GREEN));
+  this.speed=BOT_SPEED*this.gait.baseSpeedMul; this.turnRate=TURN_RATE*this.gait.turnMul;
+  this.fatigueRate=1/240; this.restDuration=20; this.roll=0; this.wobble=0;
+}
+GreenBot.prototype=Object.create(Bot.prototype);
+GreenBot.prototype.update=function(dt){
+  if(this.isResting){ this.restTimer-=dt; this.camPhase+=dt*0.6; this.camY=Math.sin(this.camPhase)*VOXEL*0.01; if(this.restTimer<=0){ this.isResting=false; this.fatigue=0; } return; }
+  const t=this.currentTarget(); if(!t) return;
+  // surface effects (green only)
+  const texId=surfaceTextureAt(this);
+  const score=(TEXTURE_BY_ID[texId]?.score ?? 0.8);
+  const g=this.gait;
+  const speedMul=0.65+g.texSpeedK*score;
+  const turnTexMul=0.55+g.texTurnK*score;
+  const wobbleMul=1.0+(1.2-score)*g.texWobbleK;
+  const lateralMul=1.0+(1.2-score)*g.texLateralK;
+  // desired turn
+  const dx=t.x-this.pos.x, dz=t.z-this.pos.z;
+  const distXZ=Math.max(0.001, Math.hypot(dx,dz));
+  const desired=Math.atan2(dz,dx), current=Math.atan2(this.dir.z,this.dir.x);
+  let dtheta=angleDiff(desired,current);
+  dtheta += dtheta*(g.steerNoisePct)*(Math.random()*2-1); // 10% less accurate steering
+  const baseTurn=TURN_RATE*g.turnMul*turnTexMul;
+  const bias=dtheta>0?(g.turnBiasLeft||1.0):(g.turnBiasRight||1.0);
+  let maxTurn=baseTurn*bias*dt; if(dtheta>maxTurn)dtheta=maxTurn; else if(dtheta<-maxTurn)dtheta=-maxTurn;
+  let newHeading=current+dtheta; let cosH=Math.cos(newHeading), sinH=Math.sin(newHeading);
+  // wobble
+  this.wobble += dt*2*Math.PI*(g.wobbleFreq+Math.random()*0.08)*wobbleMul;
+  const perturb=Math.sin(this.wobble)*g.wobbleAmp;
+  const cur2=Math.atan2(sinH,cosH)+perturb*dt; cosH=Math.cos(cur2); sinH=Math.sin(cur2);
+  this.dir.x=cosH; this.dir.z=sinH;
+  this.roll=Math.sin(this.wobble*2.0)*g.rollAmp;
+  // move
+  const arrive=Math.min(1, Math.max(0.3, distXZ/(VOXEL*2)));
+  const spd=BOT_SPEED*g.baseSpeedMul*speedMul;
+  const step=spd*dt*arrive;
+  this.pos.x+=cosH*step; this.pos.z+=sinH*step;
+  const ydiff=t.y-this.pos.y; const ystep=Math.min(Math.abs(ydiff), step*0.6); this.pos.y+=Math.sign(ydiff)*ystep;
+  if(this.atTarget(t)) this.pathIndex=Math.min(this.pathIndex+1, this.path.length);
+  if(MODE_2D){ this.pos.y=0; }
+  const moved=Math.hypot(this.pos.x-this._lx, this.pos.y-this._ly, this.pos.z-this._lz);
+  if(moved<1){ this._stuckTime+=dt; } else { this._stuckTime=0; this._lx=this.pos.x; this._ly=this.pos.y; this._lz=this.pos.z; }
+  if(this._stuckTime>2){ requestReplan(this); this._stuckTime=0; }
+  this.camPhase += (step/VOXEL)*2.5; this.camY = Math.sin(this.camPhase)*VOXEL*0.03;
+  const effort=0.6+0.4*arrive; this.fatigue += dt*this.fatigueRate*effort; if(this.fatigue>=1){ this.isResting=true; this.restTimer=this.restDuration*(0.9+Math.random()*0.2); }
+  // asym extras
+  const speedMod=1+g.speedBiasAmp*Math.sin(this.wobble*2.0+0.3)*wobbleMul;
+  this.pos.x+=cosH*spd*(speedMod-1)*dt; this.pos.z+=sinH*spd*(speedMod-1)*dt;
+  const sideX=-sinH, sideZ=cosH; const sway=Math.sin(this.wobble*2.0)*g.limpLatAmp*dt*lateralMul;
+  this.pos.x+=sideX*sway; this.pos.z+=sideZ*sway;
+};
+
+function OrangeBot(){ Bot.call(this,'#E65C00'); this.type='orange'; this.gait=JSON.parse(JSON.stringify(DEFAULT_GAIT_ORANGE));
+  this.speed=BOT_SPEED*this.gait.baseSpeedMul; this.turnRate=TURN_RATE*this.gait.turnMul; this.fatigueRate=1/300; this.restDuration=15;
+}
+OrangeBot.prototype=Object.create(Bot.prototype);
+OrangeBot.prototype.update=function(dt){ const s=this.speed,t=this.turnRate; this.speed=BOT_SPEED*this.gait.baseSpeedMul; this.turnRate=TURN_RATE*this.gait.turnMul; Bot.prototype.update.call(this,dt); this.speed=s; this.turnRate=t; };
+
+// ============================
+// Simulation state
+// ============================
+let W=0,H=0,viewRects=[],viewRectsGL=[]; let dragging=false,lastX=0,lastY=0; let orbitYaw=0.7, orbitPitch=-0.5, orbitDist=WORLD_SIZE*0.9;
+let _hudG=null;
+let bots=[], greenBot=null, orangeBot=null; let NUM_GREEN=1, NUM_ORANGE=1;
+let goal=null; let captureLock=false; let scores={green:0,orange:0,ties:0,rounds:0}, lastWinner='-';
+let exportRequest=null;
+
+// ============================
+// Trails
+// ============================
+function botCount(){ return bots.length; }
+function trailsMinDist(){ const b=botCount(); if(b<=10) return TRAIL_MIN_DIST; return TRAIL_MIN_DIST*Math.min(6, 1+b/50); }
+function shouldCapTrails(){ return botCount()>=10; }
+function supportYAt(bot){
+  if(MODE_2D) return 0;
+  const t=bot.currentTarget(); if(t) return t.y;
+  return 0;
+}
+function surfaceTextureAt(bot){
+  if(MODE_2D){
+    const ij=worldToCell(bot.pos.x, bot.pos.z); return gridTexture[ij.i][ij.j];
+  }else{
+    // if inside a building, take that floor's texture; else street asphalt
+    for(const b of buildings){
+      const w=b.footprint.w, d=b.footprint.d;
+      if(bot.pos.x>=b.x-w/2 && bot.pos.x<=b.x+w/2 && bot.pos.z>=b.z-d/2 && bot.pos.z<=b.z+d/2){
+        const f=Math.max(0, Math.min(b.floors-1, Math.round(bot.pos.y/VOXEL)));
+        return b.floorTextures[f]||'polished_concrete';
+      }
+    }
+    return 'asphalt';
+  }
+}
+function sampleTrails(){
+  const minDist=trailsMinDist()/Math.sqrt(Math.max(1, TIME_SCALE||1));
+  for(const bot of bots){
+    const tr=bot.trail, pX=bot.pos.x, pZ=bot.pos.z, pY=supportYAt(bot), hd=Math.atan2(bot.dir.z,bot.dir.x);
+    if(tr.length){
+      const prev=tr[tr.length-1]; const dx=pX-prev.x, dz=pZ-prev.z; const dist=Math.hypot(dx,dz); const dH=Math.abs(angleDiff(hd, prev._hdg||hd));
+      if(dist<minDist && dH<0.08) continue;
+    }
+    tr.push({x:pX,y:pY,z:pZ,_hdg:hd});
+    if(shouldCapTrails() && tr.length>TRAIL_MAX_POINTS) tr.splice(0, tr.length-TRAIL_MAX_POINTS);
+  }
+}
+function clearTrails(){ for(const b of bots){ b.trail.length=0; } }
+
+// ============================
+// Setup & Loop
+// ============================
+function setup(){
+  createCanvas(window.innerWidth, window.innerHeight, WEBGL);
+  _hudG = createGraphics(window.innerWidth, window.innerHeight); _hudG.pixelDensity(1);
+  frameRate(FRAME_RATE);
+  computeViewRects();
+  document.getElementById('timeBadge').onclick=toggleTimeScale;
+  document.getElementById('modeBadge').onclick=toggleMode2D;
+  // disable Space default scrolling and do not bind to pause
+  window.addEventListener('keydown', (e)=>{ if(e.code==='Space'){ e.preventDefault(); } }, {passive:false});
+  document.getElementById('numGreen').addEventListener('change', (e)=>{ const n=Math.max(0, Math.floor(+e.target.value||0)); setBotCounts(n, NUM_ORANGE); });
+  document.getElementById('numOrange').addEventListener('change', (e)=>{ const n=Math.max(0, Math.floor(+e.target.value||0)); setBotCounts(NUM_GREEN, n); });
+  rebuildBots(); modeUpdateBadge(); newScenario();
+}
+function windowResized(){ resizeCanvas(window.innerWidth, window.innerHeight); computeViewRects(); if(_hudG){ _hudG.resizeCanvas(window.innerWidth, window.innerHeight); } }
+function computeViewRects(){ const W=width,H=height; viewRects=[{x:0,y:0,w:W/2,h:H/2},{x:W/2,y:0,w:W/2,h:H/2},{x:0,y:H/2,w:W/2,h:H/2},{x:W/2,y:H/2,w:W/2,h:H/2}]; viewRectsGL=[{x:0,y:H/2,w:W/2,h:H/2},{x:W/2,y:H/2,w:W/2,h:H/2},{x:0,y:0,w:W/2,h:H/2},{x:W/2,y:0,w:W/2,h:H/2}]; }
+function setViewport(i){ const r=viewRects[i],rGL=viewRectsGL[i]; const gl=drawingContext; const dpr=(window.devicePixelRatio||1); gl.viewport(rGL.x*dpr,rGL.y*dpr,rGL.w*dpr,rGL.h*dpr); gl.enable(gl.SCISSOR_TEST); gl.scissor(rGL.x*dpr,rGL.y*dpr,rGL.w*dpr,rGL.h*dpr); gl.clearColor(12/255,12/255,12/255,1); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT); perspective(Math.PI/3,r.w/r.h,1,WORLD_SIZE*4); }
+function endViewport(){ const gl=drawingContext; const dpr=(window.devicePixelRatio||1); gl.viewport(0,0,width*dpr,height*dpr); gl.disable(gl.SCISSOR_TEST); }
+function orbitView(){ const r=viewRects[0]; if(mouseIsPressed){ if(mouseX>=r.x&&mouseX<r.x+r.w&&mouseY>=r.y&&mouseY<r.y+r.h){ if(!dragging){dragging=true;lastX=mouseX;lastY=mouseY} const dx=(mouseX-lastX)/r.w,dy=(mouseY-lastY)/r.h; orbitYaw+=dx*2*Math.PI; orbitPitch=constrain(orbitPitch+dy*Math.PI,-1.2,0.2); lastX=mouseX;lastY=mouseY; } } else dragging=false; const cx=0,cy=WORLD_SIZE*0.15,cz=0; const ex=cx+orbitDist*Math.cos(orbitPitch)*Math.cos(orbitYaw); const ey=cy+orbitDist*Math.sin(orbitPitch); const ez=cz+orbitDist*Math.cos(orbitPitch)*Math.sin(orbitYaw); camera(ex,ey,ez,cx,cy,cz,0,1,0); }
+
+let _camState={green:{eye:null,center:null}};
+function botCamera(bot){ const fX=bot.dir.x,fZ=bot.dir.z; const baseY=supportYAt(bot); const pX=bot.pos.x,pZ=bot.pos.z; const posY=baseY+bot.height+bot.camY; const eye={x:pX,y:posY,z:pZ}; const center={x:pX+fX*VOXEL*6,y:posY,z:pZ+fZ*VOXEL*6}; if(!_camState.green.eye){_camState.green.eye={x:eye.x,y:eye.y,z:eye.z};_camState.green.center={x:center.x,y:center.y,z:center.z}} const a=0.15; _camState.green.eye.x+=(eye.x-_camState.green.eye.x)*a; _camState.green.eye.y+=(eye.y-_camState.green.eye.y)*a; _camState.green.eye.z+=(eye.z-_camState.green.eye.z)*a; _camState.green.center.x+=(center.x-_camState.green.center.x)*a; _camState.green.center.y+=(center.y-_camState.green.center.y)*a; _camState.green.center.z+=(center.z-_camState.green.center.z)*a; camera(_camState.green.eye.x,_camState.green.eye.y,_camState.green.eye.z,_camState.green.center.x,_camState.green.center.y,_camState.green.center.z,0,1,0); }
+
+function draw(){
+  background(12);
+  let dtReal=(deltaTime/1000)*(paused?0:TIME_SCALE), remaining=dtReal, MAX_STEP=1/120;
+  while(remaining>0){ const step=Math.min(MAX_STEP,remaining); for(let i=0;i<bots.length;i++) bots[i].update(step); remaining-=step; }
+  checkGoalCapture(); sampleTrails();
+
+  // ① Iso 3D
+  push(); setViewport(0); orbitView(); drawCityWireframe({nearOnly:false,drawInteriors:!MODE_2D,groundGridStep:VOXEL*10}); drawTrails3D({nearOnly:false}); drawGoalMarker(); drawBots3D(false); pop(); endViewport();
+  // ② Top-down
+  push(); setViewport(1); drawTopDown(); pop(); endViewport();
+  // ③ Follow Green (top-down)
+  push(); setViewport(2); drawTopDownFollowGreen(); pop(); endViewport();
+  // ④ Follow Orange (top-down)
+  push(); setViewport(3); drawTopDownFollowOrange(); pop(); endViewport();
+
+  drawSplitBorders();
+}
+
+// ============================
+// UI layers (HUD borders etc)
+// ============================
+function drawSplitBorders(){
+  if(!SPLIT_BORDER_ON) return;
+  if(!_hudG){ _hudG = createGraphics(width, height); _hudG.pixelDensity(1); }
+  const g=_hudG; g.clear();
+  g.noFill(); g.stroke(60); g.strokeWeight(1.5);
+  // crosshair
+  g.line(g.width/2, 0, g.width/2, g.height);
+  g.line(0, g.height/2, g.width, g.height/2);
+  // quadrant outlines
+  g.noFill();
+  g.rect(0, 0, g.width/2, g.height/2);
+  g.rect(g.width/2, 0, g.width/2, g.height/2);
+  g.rect(0, g.height/2, g.width/2, g.height/2);
+  g.rect(g.width/2, g.height/2, g.width/2, g.height/2);
+  // HUD stats (no view names in corners)
+  g.noStroke(); g.fill(220); g.textSize(12);
+  const gLead=greenBot, oLead=orangeBot;
+  const hud1='Green '+(gLead?Math.floor(gLead.fatigue*100):'-')+'%'+(gLead&&gLead.isResting?' (rest)':'')+' • '+
+             'Orange '+(oLead?Math.floor(oLead.fatigue*100):'-')+'%'+(oLead&&oLead.isResting?' (rest)':'')+
+             ' • Access:'+cityAccessibility+' • Bots:'+bots.length;
+  const hud2='Score  G:'+scores.green+'  O:'+scores.orange+'  Ties:'+scores.ties+'  Rounds:'+scores.rounds+'  Last:'+lastWinner;
+  g.text(hud1, 16, g.height-34);
+  g.text(hud2, 16, g.height-16);
+  resetMatrix();
+  image(g, -width/2, -height/2, width, height);
+}
+
+// ============================
+// Drawing
+// ============================
+function drawCityWireframe(opts){
+  opts=opts||{}; const nearOnly=(opts.nearOnly!==undefined?opts.nearOnly:false), origin=(opts.origin||{x:0,z:0}); const radius=(opts.radius!==undefined?opts.radius:Infinity), drawInteriors=(opts.drawInteriors!==undefined?opts.drawInteriors:true), groundGridStep=(opts.groundGridStep!==undefined?opts.groundGridStep:VOXEL*10);
+  const r2=radius*radius;
+  // ground grid
+  if(groundGridStep>0){ stroke(28); for(let x=-WORLD_SIZE/2,y=0;x<=WORLD_SIZE/2;x+=groundGridStep){ line(x,y,-WORLD_SIZE/2,x,y,WORLD_SIZE/2); } for(let z=-WORLD_SIZE/2,y2=0;z<=WORLD_SIZE/2;z+=groundGridStep){ line(-WORLD_SIZE/2,y2,z, WORLD_SIZE/2,y2,z); } }
+  // streets
+  stroke(100); for(let i=0;i<streets.length;i++){ const e=streets[i]; if(nearOnly){ const da=(e.a.x-origin.x)**2+(e.a.z-origin.z)**2; const db=(e.b.x-origin.x)**2+(e.b.z-origin.z)**2; if(da>r2 && db>r2) continue; } line(e.a.x,0.2,e.a.z, e.b.x,0.2,e.b.z); }
+  // buildings
+  for(let i=0;i<buildings.length;i++){
+    const b=buildings[i]; const w=b.footprint.w, d=b.footprint.d, h=(b.floors-1)*VOXEL, x=b.x, z=b.z;
+    if(nearOnly){ const dx=x-origin.x, dz=z-origin.z; if(dx*dx+dz*dz>r2) continue; }
+    stroke(180); noFill();
+    // wireframe box
+    line(x-w/2,0,z-d/2, x+w/2,0,z-d/2); line(x+w/2,0,z-d/2, x+w/2,0,z+d/2); line(x+w/2,0,z+d/2, x-w/2,0,z+d/2); line(x-w/2,0,z+d/2, x-w/2,0,z-d/2);
+    line(x-w/2,0,z-d/2, x-w/2,h,z-d/2); line(x+w/2,0,z-d/2, x+w/2,h,z-d/2); line(x+w/2,0,z+d/2, x+w/2,h,z+d/2); line(x-w/2,0,z+d/2, x-w/2,h,z+d/2);
+    line(x-w/2,h,z-d/2, x+w/2,h,z-d/2); line(x+w/2,h,z-d/2, x+w/2,h,z+d/2); line(x+w/2,h,z+d/2, x-w/2,h,z+d/2); line(x-w/2,h,z+d/2, x-w/2,h,z-d/2);
+    // faint surfaces (3D only), none in 2D
+    if(!MODE_2D){ noStroke(); fill(255,255,255,26); push(); translate(x,0,z); box(w,h,d); pop(); }
+    if(drawInteriors){
+      noFill(); stroke(90,90,90,180);
+      for(let y=0;y<=h;y+=VOXEL){ line(x-w/2,y,z-d/2, x+w/2,y,z-d/2); line(x+w/2,y,z-d/2, x+w/2,y,z+d/2); line(x+w/2,y,z+d/2, x-w/2,y,z+d/2); line(x-w/2,y,z+d/2, x-w/2,y,z-d/2); }
+      stroke(140); const e=b.rampEdge; for(let f=0; f<b.floors-1; f++){ const a=b.connectorPos(e,f), c=b.connectorPos(e,f+1); line(a.x,a.y,a.z, c.x,c.y,c.z); }
+    }
+  }
+  // sky bridges (only 3D mode)
+  if(!MODE_2D){ stroke(140); for(let i=0;i<bridges.length;i++){ const br=bridges[i], p1=br.p1, p2=br.p2; line(p1.x,p1.y,p1.z, p2.x,p2.y,p2.z); } }
+}
+
+function drawBots3D(isFPV){
+  for(let i=0;i<bots.length;i++){
+    const b=bots[i]; if(isFPV && b===greenBot) continue;
+    push(); translate(b.pos.x, supportYAt(b)+b.height*0.5, b.pos.z);
+    noFill(); stroke(220,220,220,90); box(VOXEL*0.8,b.height,VOXEL*0.8);
+    const rc=b.rgb.r,gc=b.rgb.g,bc=b.rgb.b; noFill(); stroke(rc,gc,bc); box(VOXEL*0.5,b.height*0.9,VOXEL*0.5);
+    // small circular head visible in all views
+    const headR=VOXEL*0.1; const fX=b.dir.x, fZ=b.dir.z; const hx=fX*VOXEL*0.18, hz=fZ*VOXEL*0.18;
+    push(); translate(hx, b.height*0.5 + headR*1.1, hz); noFill(); stroke(rc,gc,bc,255); sphere(headR*0.98); pop();
+    pop();
+  }
+}
+
+function drawGoalMarker(){ if(!goal) return; const g=goal.pos; stroke(150,220,255); line(g.x-VOXEL,g.y,g.z-VOXEL, g.x+VOXEL,g.y,g.z+VOXEL); line(g.x-VOXEL,g.y,g.z+VOXEL, g.x+VOXEL,g.y,g.z-VOXEL); }
+
+function drawTrails3D(opts){
+  opts=opts||{}; const nearOnly=(opts.nearOnly!==undefined?opts.nearOnly:false), origin=(opts.origin||{x:0,z:0}); const radius=(opts.radius!==undefined?opts.radius:Infinity); const r2=radius*radius;
+  // Draw as lines only (no fills) to avoid "white surface" effect
+  const step=1;
+  // halo
+  strokeWeight(7);
+  for(const b of bots){
+    const tr=b.trail; stroke(b.rgb.r,b.rgb.g,b.rgb.b,60);
+    for(let j=1;j<tr.length;j+=step){
+      const a=tr[j-1], d=tr[j];
+      if(nearOnly){ const da=(a.x-origin.x)**2+(a.z-origin.z)**2; const db=(d.x-origin.x)**2+(d.z-origin.z)**2; if(da>r2 && db>r2) continue; }
+      line(a.x,a.y+2,a.z, d.x,d.y+2,d.z);
+    }
+  }
+  // core
+  strokeWeight(3);
+  for(const b of bots){
+    const tr=b.trail; stroke(b.rgb.r,b.rgb.g,b.rgb.b,230);
+    for(let j=1;j<tr.length;j+=step){
+      const a=tr[j-1], d=tr[j];
+      if(nearOnly){ const da=(a.x-origin.x)**2+(a.z-origin.z)**2; const db=(d.x-origin.x)**2+(d.z-origin.z)**2; if(da>r2 && db>r2) continue; }
+      line(a.x,a.y+2,a.z, d.x,d.y+2,d.z);
+    }
+  }
+  strokeWeight(1);
+}
+
+function drawTrailsTopDownConstPlane(yPlane, cx, cz, radius){
+  const r2 = radius ? radius*radius : Infinity;
+  const step=1;
+  // halo
+  strokeWeight(7);
+  for(const b of bots){
+    const tr=b.trail; stroke(b.rgb.r,b.rgb.g,b.rgb.b,60);
+    for(let i=1;i<tr.length;i+=step){
+      const a=tr[i-1], d=tr[i];
+      if(radius){
+        const da=(a.x-(cx||0))**2+(a.z-(cz||0))**2;
+        const db=(d.x-(cx||0))**2+(d.z-(cz||0))**2;
+        if(da>r2 && db>r2) continue;
+      }
+      line(a.x,yPlane,a.z, d.x,yPlane,d.z);
+    }
+  }
+  // core
+  strokeWeight(3);
+  for(const b of bots){
+    const tr=b.trail; stroke(b.rgb.r,b.rgb.g,b.rgb.b,230);
+    for(let i=1;i<tr.length;i+=step){
+      const a=tr[i-1], d=tr[i];
+      if(radius){
+        const da=(a.x-(cx||0))**2+(a.z-(cz||0))**2;
+        const db=(d.x-(cx||0))**2+(d.z-(cz||0))**2;
+        if(da>r2 && db>r2) continue;
+      }
+      line(a.x,yPlane,a.z, d.x,yPlane,d.z);
+    }
+  }
+  strokeWeight(1);
+}
+
+function drawHeadsTopDownConstPlane(yPlane, cx, cz, radius){
+  const r2 = radius ? radius*radius : Infinity;
+  for(const b of bots){
+    if(radius){
+      const dx=b.pos.x-(cx||0), dz=b.pos.z-(cz||0); if(dx*dx+dz*dz>r2) continue;
+    }
+    const rc=b.rgb.r,gc=b.rgb.g,bc=b.rgb.b, headR=VOXEL*0.1;
+    push(); translate(b.pos.x, yPlane+0.6, b.pos.z); noFill(); stroke(rc,gc,bc,255); sphere(headR); pop();
+  }
+}
+
+function drawTopDown(){
+  ortho(-WORLD_SIZE/2, WORLD_SIZE/2, WORLD_SIZE/2, -WORLD_SIZE/2, 1, WORLD_SIZE*4);
+  camera(0, WORLD_SIZE*2, 0, 0, 0, 0, 0, 0, -1);
+  const y=0.2;
+  stroke(28); for(let x=-WORLD_SIZE/2; x<=WORLD_SIZE/2; x+=CELL_SIZE){ line(x,0,-WORLD_SIZE/2, x,0,WORLD_SIZE/2); } for(let z=-WORLD_SIZE/2; z<=WORLD_SIZE/2; z+=CELL_SIZE){ line(-WORLD_SIZE/2,0,z, WORLD_SIZE/2,0,z); }
+  stroke(100); for(let i=0;i<streets.length;i++){ const e=streets[i]; line(e.a.x,y,e.a.z, e.b.x,y,e.b.z); }
+  stroke(180); for(let i=0;i<buildings.length;i++){ const b=buildings[i]; const w=b.footprint.w, d=b.footprint.d, x=b.x, z=b.z; line(x-w/2,y,z-d/2, x+w/2,y,z-d/2); line(x+w/2,y,z-d/2, x+w/2,y,z+d/2); line(x+w/2,y,z+d/2, x-w/2,y,z+d/2); line(x-w/2,y,z+d/2, x-w/2,y,z-d/2); }
+  if(!MODE_2D){ stroke(140); for(let i=0;i<bridges.length;i++){ const br=bridges[i], p1=br.p1, p2=br.p2; line(p1.x,y+0.1,p1.z, p2.x,y+0.1,p2.z); } }
+  drawTrailsTopDownConstPlane(0.48);
+  drawHeadsTopDownConstPlane(0.52);
+}
+
+function drawTopDownFollowGeneric(bot){
+  if(!bot) return;
+  let R = FOLLOW_R; if(MODE_2D) R *= 0.5; // 2D mode a bit tighter by default
+  const bx=bot.pos.x, bz=bot.pos.z, by=supportYAt(bot);
+  ortho(-R,R,R,-R,1,WORLD_SIZE*4); camera(bx,by+WORLD_SIZE*0.6+bots.length, bz, bx,by,bz, 0,0,-1);
+  const yGrid=by;
+  stroke(28); const step=CELL_SIZE;
+  const minX=Math.floor((bx-R)/step)*step, maxX=Math.ceil((bx+R)/step)*step;
+  const minZ=Math.floor((bz-R)/step)*step, maxZ=Math.ceil((bz+R)/step)*step;
+  for(let x=minX;x<=maxX;x+=step){ line(x,yGrid,minZ, x,yGrid,maxZ); } for(let z=minZ;z<=maxZ;z+=step){ line(minX,yGrid,z, maxX,yGrid,z); }
+  stroke(100); for(let i=0;i<streets.length;i++){ const e=streets[i]; const aFar=(Math.abs(e.a.x-bx)>R*1.3 || Math.abs(e.a.z-bz)>R*1.3); const bFar=(Math.abs(e.b.x-bx)>R*1.3 || Math.abs(e.b.z-bz)>R*1.3); if(aFar&&bFar) continue; line(e.a.x,yGrid+0.1,e.a.z, e.b.x,yGrid+0.1,e.b.z); }
+  stroke(180); for(let i=0;i<buildings.length;i++){ const b=buildings[i]; const dx=b.x-bx, dz=b.z-bz; if(dx*dx+dz*dz>R*R*2.25) continue; const w=b.footprint.w, d=b.footprint.d, x0=b.x, z0=b.z; line(x0-w/2,yGrid,x0-d/2, x0+w/2,yGrid,z0-d/2); line(x0+w/2,yGrid,z0-d/2, x0+w/2,yGrid,z0+d/2); line(x0+w/2,yGrid,z0+d/2, x0-w/2,yGrid,z0+d/2); line(x0-w/2,yGrid,z0+d/2, x0-w/2,yGrid,z0-d/2); }
+  if(!MODE_2D){ stroke(140); for(let i=0;i<bridges.length;i++){ const br=bridges[i], p1=br.p1, p2=br.p2; const far1=((p1.x-bx)*(p1.x-bx)+(p1.z-bz)*(p1.z-bz)>R*R*2.25); const far2=((p2.x-bx)*(p2.x-bx)+(p2.z-bz)*(p2.z-bz)>R*R*2.25); if(far1&&far2) continue; line(p1.x,yGrid+0.1,p1.z, p2.x,yGrid+0.1,p2.z); } }
+  drawTrailsTopDownConstPlane(yGrid+0.48, bx, bz, R);
+  drawHeadsTopDownConstPlane(yGrid+0.52, bx, bz, R);
+}
+function drawTopDownFollowGreen(){ drawTopDownFollowGeneric(greenBot||bots.find(b=>b.type==='green')); }
+function drawTopDownFollowOrange(){ drawTopDownFollowGeneric(orangeBot||bots.find(b=>b.type==='orange')); }
+
+// ============================
+// Export (1–4: full wireframes+trails; 5–8 trails-only)
+// ============================
+const EXPORT_SIZE=10000;
+function exportViewPNG(viewIndex, trailsOnly){
+  const oldW=width, oldH=height, oldPD=pixelDensity();
+  paused=true;
+  try{ pixelDensity(1); }catch(e){}
+  resizeCanvas(EXPORT_SIZE, EXPORT_SIZE);
+  // Draw the requested view fullscreen (no scissor)
+  background(12);
+  if(viewIndex===1){ // Iso
+    const cx=0, cy=WORLD_SIZE*0.15, cz=0;
+    const ex=cx+orbitDist*Math.cos(orbitPitch)*Math.cos(orbitYaw);
+    const ey=cy+orbitDist*Math.sin(orbitPitch);
+    const ez=cz+orbitDist*Math.cos(orbitPitch)*Math.sin(orbitYaw);
+    camera(ex,ey,ez,cx,cy,cz,0,1,0);
+    perspective(Math.PI/3, 1, 1, WORLD_SIZE*4);
+    drawCityWireframe({ nearOnly:false, drawInteriors:!MODE_2D, groundGridStep: VOXEL*10 });
+    if(!trailsOnly){} // still draw trails below
+    drawTrails3D({ nearOnly:false });
+  } else if(viewIndex===2){ // Top-down
+    ortho(-WORLD_SIZE/2, WORLD_SIZE/2, WORLD_SIZE/2, -WORLD_SIZE/2, 1, WORLD_SIZE*4);
+    camera(0, WORLD_SIZE*2, 0, 0, 0, 0, 0, 0, -1);
+    drawTopDown();
+  } else if(viewIndex===3){ // Follow Green
+    drawTopDownFollowGreen();
+  } else if(viewIndex===4){ // Follow Orange
+    drawTopDownFollowOrange();
+  }
+  if(trailsOnly){
+    // redraw only trails on clean background
+    background(12);
+    if(viewIndex===1){ drawTrails3D({ nearOnly:false }); }
+    else if(viewIndex===2){ drawTrailsTopDownConstPlane(0.48); }
+    else if(viewIndex===3){ const by=supportYAt(greenBot||bots[0]); drawTrailsTopDownConstPlane(by+0.48, (greenBot||bots[0]).pos.x, (greenBot||bots[0]).pos.z, FOLLOW_R*(MODE_2D?0.5:1)); }
+    else if(viewIndex===4){ const by=supportYAt(orangeBot||bots[0]); drawTrailsTopDownConstPlane(by+0.48, (orangeBot||bots[0]).pos.x, (orangeBot||bots[0]).pos.z, FOLLOW_R*(MODE_2D?0.5:1)); }
+  }
+  const fname = (trailsOnly?'trails':'wireframes')+'_view'+viewIndex+'_'+Date.now();
+  saveCanvas(fname,'png');
+  // restore
+  try{ pixelDensity(oldPD); }catch(e){}
+  resizeCanvas(oldW, oldH);
+  computeViewRects();
+  paused=(TIME_SCALE===0);
+}
+
+// Capture D to toggle DSL without typing into the textarea
+document.addEventListener('keydown', function(e){
+  if((e.key==='d'||e.key==='D') && !e.metaKey && !e.ctrlKey && !e.altKey){
+    const modal=document.getElementById('dslModal');
+    const open=modal && modal.style.display!=='none';
+    const ae=document.activeElement;
+    const typingInDSL=open && ae && ae.id==='dslText';
+    if(!open || (open && !typingInDSL)){
+      e.preventDefault(); e.stopPropagation();
+      toggleDSL();
+    }
+  }
+}, true);
+
+function keyPressed(){
+  if(key==='R'||key==='r'){ newScenario(); return; }
+  if(key==='C'||key==='c'){ clearTrails(); return; }
+  if(key==='T'||key==='t'){ toggleTimeScale(); return; }
+  if(key==='L'||key==='l'){ const lg=document.getElementById('legend'); if(lg) lg.style.display=(lg.style.display==='none'?'block':'none'); return; }
+  if(key==='M'||key==='m'){ toggleMode2D(); return; }
+  if(key>='1' && key<='4'){ exportViewPNG(parseInt(key,10), false); return; }
+  if(key>='5' && key<='8'){ exportViewPNG(parseInt(key,10)-4, true); return; }
+}
+
+// ============================
+// Scenario, goals, planning
+// ============================
+function pickRandomGoal3D(){
+  if(buildings.length===0) return null;
+  const bi=(Math.random()*buildings.length)|0, b=buildings[bi];
+  const floor=(Math.random()*b.floors)|0;
+  return {buildingIndex:bi, floor, pos:b.centerOfFloor(floor)};
+}
+function pickRandomTile2D(){
+  let tries=0;
+  while(tries<5000){
+    const i=(Math.random()*GRID_N)|0, j=(Math.random()*GRID_N)|0;
+    if(!gridBlocked[i][j]) return {i,j};
+    tries++;
+  }
+  return {i:0,j:0};
+}
+function planPaths(){
+  if(MODE_2D){
+    const goalIJ=pickRandomTile2D(); goal={pos:cellToWorld(goalIJ.i,goalIJ.j), ij:goalIJ};
+    for(const b of bots){
+      const startIJ=worldToCell(b.pos.x,b.pos.z);
+      const forGreen=(b.type==='green');
+      const path=aStar2DWeighted(startIJ, goalIJ, forGreen);
+      if(path && path.length>=2){ b.setPath(path, []); } else { // fallback: pick another goal
+        const alt=pickRandomTile2D(); goal={pos:cellToWorld(alt.i,alt.j), ij:alt};
+        const path2=aStar2DWeighted(startIJ, alt, forGreen);
+        if(path2 && path2.length>=2) b.setPath(path2, []);
+      }
+    }
+  }else{
+    goal=pickRandomGoal3D();
+    const bGoal=buildings[goal.buildingIndex];
+    graph.addNode(goal.pos); graph.addEdge(bGoal.centerOfFloor(goal.floor), goal.pos, 'ramp');
+    for(const b of bots){
+      const start=nearestGraphPos(b.pos);
+      const filter=(b.type==='green') ? 'rampsOnly' : null;
+      const path=graph.aStar(start, goal.pos, filter);
+      if(path && path.length>=2){ b.setPath(path, []); } else {
+        // try new goal a few times
+        let tries=0, ok=false;
+        while(tries<10 && !ok){
+          goal=pickRandomGoal3D();
+          const bG=buildings[goal.buildingIndex];
+          graph.addNode(goal.pos); graph.addEdge(bG.centerOfFloor(goal.floor), goal.pos, 'ramp');
+          const p2=graph.aStar(start, goal.pos, filter);
+          if(p2 && p2.length>=2){ b.setPath(p2, []); ok=true; }
+          tries++;
+        }
+      }
+    }
+  }
+}
+
+function newScenario(){
+  generateCity();
+  assignFloorTexturesAndAccessibility();
+  build2DFields();
+  // place bots at random street nodes
+  for(const b of bots){
+    if(MODE_2D){
+      const t=pickRandomTile2D(); const p=cellToWorld(t.i,t.j); b.setStart(p);
+    }else{
+      const i=(Math.random()*BUILDING_GRID)|0, j=(Math.random()*BUILDING_GRID)|0; b.setStart(gridToWorld(i,j));
+    }
+  }
+  planPaths();
+  clearTrails();
+}
+
+function requestReplan(bot){
+  if(MODE_2D){
+    const startIJ=worldToCell(bot.pos.x,bot.pos.z);
+    const forGreen=(bot.type==='green');
+    const goalIJ=goal?.ij || pickRandomTile2D();
+    const p=aStar2DWeighted(startIJ, goalIJ, forGreen);
+    if(p && p.length>=2) bot.setPath(p, []);
+  }else{
+    const start=nearestGraphPos(bot.pos);
+    const filter=(bot.type==='green') ? 'rampsOnly' : null;
+    const p=graph.aStar(start, goal.pos, filter);
+    if(p && p.length>=2) bot.setPath(p, []);
+  }
+}
+
+function checkGoalCapture(){
+  if(!goal || captureLock) return;
+  const g=goal.pos; const r2=(VOXEL*0.8)**2;
+  let greenHit=false, orangeHit=false;
+  for(const b of bots){
+    const dx=b.pos.x-g.x, dy=b.pos.y-g.y, dz=b.pos.z-g.z;
+    if(dx*dx+dy*dy+dz*dz <= r2){ if(b.type==='green') greenHit=true; if(b.type==='orange') orangeHit=true; }
+  }
+  if(greenHit || orangeHit){
+    captureLock=true;
+    if(greenHit && !orangeHit){ scores.green++; lastWinner='green'; }
+    else if(orangeHit && !greenHit){ scores.orange++; lastWinner='orange'; }
+    else { scores.ties++; lastWinner='tie'; }
+    scores.rounds++;
+    planPaths();
+    setTimeout(()=>{ captureLock=false; }, 50);
+  }
+}
+
+// ============================
+// Extra bots
+// ============================
+function rebuildBots(){
+  bots.length=0;
+  greenBot=new GreenBot(); orangeBot=new OrangeBot();
+  bots.push(greenBot, orangeBot);
+  for(let i=1;i<NUM_GREEN;i++) bots.push(new GreenBot());
+  for(let i=1;i<NUM_ORANGE;i++) bots.push(new OrangeBot());
+}
+function setBotCounts(nGreen, nOrange){
+  NUM_GREEN=nGreen; NUM_ORANGE=nOrange;
+  rebuildBots();
+  newScenario();
+}
+
+// ============================
+// DSL
+// ============================
+let _dslOpen=false;
+function toggleDSL(){ const m=document.getElementById('dslModal'); if(!m) return; _dslOpen=!_dslOpen; m.style.display=_dslOpen?'flex':'none'; if(_dslOpen){ const ta=document.getElementById('dslText'); if(ta){ ta.focus(); ta.selectionStart=ta.value.length; } } }
+function parseBool(v){ const s=(v||'').toString().trim().toLowerCase(); if(['on','true','1','yes'].includes(s)) return true; if(['off','false','0','no'].includes(s)) return false; return null; }
+function applyDSL(){
+  const ta=document.getElementById('dslText'); const err=document.getElementById('dslError'); if(err) err.textContent='';
+  if(!ta){ toggleDSL(); return; }
+  const lines=ta.value.split(/\r?\n/);
+  for(let i=0;i<lines.length;i++){
+    const ln=lines[i].trim(); if(!ln || ln[0]==='#') continue;
+    const m=ln.match(/^([A-Za-z_][\w\.\-]*)\s*:\s*(.+)$/); if(!m) continue;
+    const key=m[1].toLowerCase(); const val=m[2];
+    if(key==='splitborder' || key==='border' || key==='borders'){ const b=parseBool(val); if(b===null){ if(err) err.textContent='splitBorder expects on/off/true/false'; } else { SPLIT_BORDER_ON=b; } }
+    else if(key==='followradius'){ const r=parseFloat(val); if(!isNaN(r)&&r>100) FOLLOW_R=r; }
+    else if(key==='green.count'){ const n=parseInt(val,10); if(!isNaN(n)&&n>=0){ NUM_GREEN=n; } }
+    else if(key==='orange.count'){ const n=parseInt(val,10); if(!isNaN(n)&&n>=0){ NUM_ORANGE=n; } }
+  }
+  // Apply counts immediately
+  setBotCounts(NUM_GREEN, NUM_ORANGE);
+  toggleDSL();
+}
+document.addEventListener('click', function(e){
+  if(e.target && e.target.id==='dslApply'){ applyDSL(); }
+  if(e.target && e.target.id==='dslClose'){ toggleDSL(); }
+  if(e.target && e.target.id==='dslModal'){ if(e.target===document.getElementById('dslModal')) toggleDSL(); }
+});
+
+// ============================
+// Legend toggle
+// ============================
+(function(){
+  const lg=document.getElementById('legend');
+  if(lg) lg.style.display='none';
+})();
+
+
+// ============================
+// Import Bot support (JSON)
+// ============================
+(function(){
+  function normalizeColor(c){ if(!c) return null; if(/^#/.test(c)) return c; if(/^[0-9a-fA-F]{6}$/.test(c)) return '#'+c; return null; }
+  function applySpecToImportedBot(bot, spec){
+    try{
+      if(spec.name) bot.name=''+spec.name;
+      if(spec.color){ const nc=normalizeColor(spec.color); if(nc){ bot.color=nc; bot.rgb=hexToRGB(nc); }}
+      const move=spec.movement||spec.gait||{};
+      if(bot.gait){
+        const g=bot.gait;
+        if(move.baseSpeedMul!=null) g.baseSpeedMul=+move.baseSpeedMul;
+        if(move.turnMul!=null) g.turnMul=+move.turnMul;
+        if(move.turnBiasLeft!=null) g.turnBiasLeft=+move.turnBiasLeft;
+        if(move.turnBiasRight!=null) g.turnBiasRight=+move.turnBiasRight;
+        if(move.steerNoisePct!=null) g.steerNoisePct=+move.steerNoisePct;
+        if(move.wobbleAmp!=null) g.wobbleAmp=+move.wobbleAmp;
+        if(move.wobbleFreq!=null) g.wobbleFreq=+move.wobbleFreq;
+        if(move.rollAmp!=null) g.rollAmp=+move.rollAmp;
+        if(move.limpLatAmp!=null) g.limpLatAmp=+move.limpLatAmp;
+        if(move.speedBiasAmp!=null) g.speedBiasAmp=+move.speedBiasAmp;
+        if(move.texSpeedK!=null) g.texSpeedK=+move.texSpeedK;
+        if(move.texTurnK!=null) g.texTurnK=+move.texTurnK;
+      }
+      if(spec.fatigueRate!=null) bot.fatigueRate=+spec.fatigueRate;
+      if(spec.restDuration!=null) bot.restDuration=+spec.restDuration;
+      // Recompute speed/turn from gait if available
+      if(bot.gait){ bot.speed=BOT_SPEED*bot.gait.baseSpeedMul; bot.turnRate=TURN_RATE*bot.gait.turnMul; }
+    }catch(e){ console.warn('applySpecToImportedBot warning', e); }
+  }
+  function ImportedBot(spec){
+    const t=((spec&&spec.template)||'orange').toLowerCase();
+    if(t==='green') { GreenBot.call(this); this.type='green'; }
+    else { OrangeBot.call(this); this.type='orange'; }
+    applySpecToImportedBot(this, spec||{});
+  }
+  ImportedBot.prototype=Object.create(Bot.prototype);
+  ImportedBot.prototype.update=function(dt){
+    if(this.type==='green') return GreenBot.prototype.update.call(this, dt);
+    return Bot.prototype.update.call(this, dt);
+  };
+  function importBotSpec(specOrArray){
+    const arr=Array.isArray(specOrArray)?specOrArray:[specOrArray];
+    for(let s of arr){
+      const count=Math.max(1, Math.floor(s?.count||1));
+      for(let i=0;i<count;i++){
+        const nb=new ImportedBot(s||{});
+        bots.push(nb);
+        if(MODE_2D){ const t=pickRandomTile2D(); const p=cellToWorld(t.i,t.j); nb.setStart(p); }
+        else { const ii=(Math.random()*BUILDING_GRID)|0, jj=(Math.random()*BUILDING_GRID)|0; nb.setStart(gridToWorld(ii,jj)); }
+      }
+    }
+    planPaths();
+  }
+  // Expose to window for external toolchains if needed
+  window.importBotSpec = importBotSpec;
+
+  // Wire up UI elements once DOM is ready
+  function initImportUI(){
+    const btn=document.getElementById('importBtn'); const inp=document.getElementById('botFile');
+    if(!btn || !inp) return;
+    btn.addEventListener('click', ()=> inp.click());
+    inp.addEventListener('change', (e)=>{
+      const f=e.target.files && e.target.files[0]; if(!f) return;
+      const r=new FileReader();
+      r.onload=()=>{ try{ const spec=JSON.parse(r.result); importBotSpec(spec); } catch(err){ console.error('Import bot JSON parse error', err); } inp.value=''; };
+      r.readAsText(f);
+    });
+  }
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', initImportUI); else initImportUI();
+})();
+
+</script>
+</body>
+</html>

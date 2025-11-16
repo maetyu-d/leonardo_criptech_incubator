@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Planetary Network — Wikipedia Snakes (p5.js)</title>
+  <style>
+    html, body { margin:0; height:100%; background:#000; color:#d9e0e6; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Courier New", monospace; }
+    canvas { outline:none; display:block; }
+
+    /* Side visited lists */
+    .visit { position:fixed; top:56px; bottom:56px; width:240px; overflow:auto;
+             background:rgba(0,0,0,0.45); border:1px solid rgba(255,255,255,0.08);
+             padding:8px 10px; border-radius:12px; line-height:1.35; font-size:12px; }
+    #visited-green { left:12px; color:rgb(128,210,160); }
+    #visited-orange { right:12px; color:rgb(255,136,64); }
+
+    /* Top/bottom marquees */
+    .marquee { position:fixed; left:0; right:0; white-space:nowrap; overflow:hidden; pointer-events:none; background:rgba(0,0,0,0.35); }
+    #marquee-top { top:0; border-bottom:1px solid rgba(255,255,255,0.08); color:rgb(128,210,160); }
+    #marquee-bottom { bottom:0; border-top:1px solid rgba(255,255,255,0.08); color:rgb(255,136,64); }
+    .marquee-inner{ display:inline-block; padding:8px 0; animation: scroll-left 22s linear infinite; font-size:13px; letter-spacing:0.35px; }
+    @keyframes scroll-left { from{ transform: translateX(0);} to{ transform: translateX(-100%);} }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.9.0/lib/p5.min.js"></script>
+</head>
+<body>
+  <div id="visited-green" class="visit"></div>
+  <div id="visited-orange" class="visit"></div>
+  <div id="marquee-top" class="marquee"><div id="marquee-top-inner" class="marquee-inner">&nbsp;</div></div>
+  <div id="marquee-bottom" class="marquee"><div id="marquee-bottom-inner" class="marquee-inner">&nbsp;</div></div>
+
+<script>
+/* ========================= State ========================= */
+let globeR, rot=0;
+let graph = new Map();           // title -> { title, summary, links[], pos, lat, lon, color }
+let nodeOrder = [];
+let palette = { orange:[255,136,64], green:[128,210,160] };
+
+let snakes = {
+  green:  { trail:[], path:null, current:null, target:null, speed:0.004, colour:palette.green,
+            behaviour:'limp', visitedSet:new Set(), visitedSeq:[], startNode:null, lastStart:0,
+            visitedList:null, marquee:null },
+  orange: { trail:[], path:null, current:null, target:null, speed:0.006, colour:palette.orange,
+            behaviour:'efficient', visitedSet:new Set(), visitedSeq:[], startNode:null, lastStart:0,
+            visitedList:null, marquee:null }
+};
+
+/* ========================= Setup / Draw ========================= */
+function setup(){
+  createCanvas(windowWidth, windowHeight, WEBGL);
+  noFill(); stroke(255); strokeWeight(1);
+  globeR = Math.min(width, height) * 0.36;
+
+  snakes.green.visitedList  = document.getElementById('visited-green');
+  snakes.orange.visitedList = document.getElementById('visited-orange');
+  snakes.green.marquee      = document.getElementById('marquee-top-inner');
+  snakes.orange.marquee     = document.getElementById('marquee-bottom-inner');
+
+  seedFromRandomWiki();
+  setTimeout(()=>{ if (nodeOrder.length===0) seedOffline(); }, 3000);
+}
+
+function windowResized(){ resizeCanvas(windowWidth, windowHeight); globeR = Math.min(width, height) * 0.36; }
+
+function draw(){
+  background(0,20);
+  orbitControl(0.1,0.1,0.1,{freeRotation:false});
+  rot += 0.0022; rotateY(rot); rotateX(Math.sin(frameCount*0.0009)*0.2);
+
+  // Globe + nodes
+  drawWireframeGlobe();
+  drawNodes();
+
+  // Overlayed elements (no depth test): chords, snakes, cities
+  const gl = this._renderer.GL; if (gl) gl.disable(gl.DEPTH_TEST);
+  drawLinks();
+  updateSnakes();
+  drawSnakes();
+  drawCity('green', -1);
+  drawCity('orange', 1);
+  if (gl) gl.enable(gl.DEPTH_TEST);
+}
+
+/* ========================= Wireframe Globe ========================= */
+function drawWireframeGlobe(){
+  const d = 28; stroke(255,60);
+  for (let i=0;i<d;i++){
+    const lat = map(i,0,d-1,-HALF_PI, HALF_PI);
+    const r = globeR * cos(lat), y = globeR * sin(lat);
+    beginShape();
+    for (let j=0;j<d;j++){ const lon=map(j,0,d-1,-PI,PI); vertex(r*cos(lon), y, r*sin(lon)); }
+    endShape(CLOSE);
+  }
+}
+
+/* ========================= Wikipedia Seeding ========================= */
+async function seedFromRandomWiki(){
+  try{
+    const res = await fetch('https://en.wikipedia.org/api/rest_v1/page/random/summary', {headers:{'Accept':'application/json'}});
+    const data = await res.json();
+    await seedFromTitle(data.title, data.extract||'');
+  }catch(e){ console.warn('Random wiki failed', e); seedOffline(); }
+}
+
+async function seedFromTitle(title, preExtract=''){
+  addNode(title, preExtract);
+  setNodePos(title, 0.1, 0.0);
+  snakes.green.current  = snakes.orange.current  = title;
+  snakes.green.startNode = snakes.orange.startNode = title; // for red highlight
+  snakes.green.visitedSet.add(title);
+  snakes.orange.visitedSet.add(title);
+  updateText('green',  title, preExtract);
+  updateText('orange', title, preExtract);
+
+  await expandFrom(title);
+
+  // independent per-snake next targets
+  chooseNextTargetFor('green');
+  chooseNextTargetFor('orange');
+  snakes.green.lastStart  = millis();
+  snakes.orange.lastStart = millis();
+}
+
+async function expandFrom(title){
+  try{
+    const api = 'https://en.wikipedia.org/w/api.php?action=parse&page=' + encodeURIComponent(title) + '&prop=links&format=json&origin=*';
+    const res = await fetch(api);
+    const js = await res.json();
+    const links = (js.parse && js.parse.links) ? js.parse.links : [];
+    const titles = links.filter(l=>!l.ns || l.ns===0).map(l=>l['*']).slice(0,60);
+    const n = graph.get(title); if(!n) return;
+    const arr = [];
+    for (let i=0;i<titles.length;i++){
+      const t = titles[i]; addNode(t);
+      const lat = (n.lat||0) + random(-0.4,0.4);
+      const lon = (n.lon||0) + map(i,0,titles.length,-PI,PI) + random(-0.2,0.2);
+      setNodePos(t, constrain(lat,-HALF_PI*0.95, HALF_PI*0.95), wrapPI(lon));
+      arr.push(t);
+    }
+    n.links = arr;
+  }catch(e){ console.warn('expandFrom failed', e); offlineExpand(title); }
+}
+
+function seedOffline(){ const root='Earth'; seedFromTitle(root,'Home planet'); }
+function offlineExpand(title){
+  const n = graph.get(title); if(!n) return;
+  const arr = [];
+  for (let i=0;i<24;i++){
+    const t = `${title}-${i}`;
+    addNode(t);
+    setNodePos(t, random(-HALF_PI, HALF_PI), random(-PI, PI));
+    arr.push(t);
+  }
+  n.links = arr;
+}
+
+/* ========================= Graph Helpers ========================= */
+function addNode(title, summary=''){
+  if(!graph.has(title)){
+    const node = { title, summary, links:[], pos:createVector(), lat:0, lon:0, color:null };
+    graph.set(title, node); nodeOrder.push(title);
+  }
+}
+function setNodePos(title, lat, lon){ const n=graph.get(title); if(!n) return; n.lat=lat; n.lon=lon; n.pos=sphToCartesian(globeR,lat,lon); }
+function sphToCartesian(r,lat,lon){ return createVector(r*cos(lat)*cos(lon), r*sin(lat), r*cos(lat)*sin(lon)); }
+function wrapPI(x){ while(x>PI) x-=TWO_PI; while(x<-PI) x+=TWO_PI; return x; }
+
+/* ========================= Text / Lists ========================= */
+function updateText(key, title, extract){
+  const s = snakes[key];
+  if (s){
+    s.visitedSeq.push(title);
+    if (s.visitedSeq.length>60) s.visitedSeq.shift();
+  }
+  if (s && s.visitedList){ s.visitedList.innerHTML += `<div>${title}</div>`; }
+  if (s && s.marquee){ s.marquee.textContent = extract ? ` ${extract}     ${extract}` : ` ${title}`; }
+}
+
+/* ========================= Rendering: Nodes + Links ========================= */
+function drawNodes(){
+  for (const [title, n] of graph){
+    let col = color(255,160);
+    if (title===snakes.green.startNode || title===snakes.orange.startNode){
+      col = color(255,0,0); // starter stays red
+    } else if (n.color==='green'){
+      col = color(128,210,160);
+    } else if (n.color==='orange'){
+      col = color(255,136,64);
+    } else if (snakes.green.visitedSet.has(title)){
+      col = color(128,210,160);
+    } else if (snakes.orange.visitedSet.has(title)){
+      col = color(255,136,64);
+    }
+    stroke(col); noFill();
+    push(); translate(n.pos.x,n.pos.y,n.pos.z); ellipse(0,0,8,8); pop();
+  }
+}
+
+function drawLinks(){
+  let count=0, cap=2000;
+  stroke(255,85); strokeWeight(1); // ~33% opacity
+  for (const [title,n] of graph){
+    if (!n.links || !n.links.length) continue;
+    const a = n.pos;
+    for (const t of n.links){
+      const c = graph.get(t); if(!c) continue;
+      const b = c.pos;
+      line(a.x,a.y,a.z, b.x,b.y,b.z);
+      if (++count > cap) return;
+    }
+  }
+}
+
+/* ========================= Snakes ========================= */
+function startSnakePath(snk, from, to){
+  const a = graph.get(from).pos.copy();
+  const b = graph.get(to).pos.copy();
+  const h = globeR * (snk.behaviour==='limp'? 0.35 : 0.28);
+  snk.path = { a, b, t:0, h };
+  snk.target = to;
+}
+
+function chooseNextTargetFor(key){
+  const s = snakes[key]; if (!s || !s.current) return;
+  if (s.path) return; // don't interrupt a snake mid-flight
+  const cur = graph.get(s.current);
+  let pool = (cur && cur.links && cur.links.length) ? cur.links.slice() : nodeOrder.slice();
+  if (!pool.length){ offlineExpand(s.current); pool = (graph.get(s.current).links || nodeOrder).slice(); }
+
+  // prefer nodes not visited by *this* snake
+  let choices = pool.filter(t=>graph.has(t) && t!==s.current && !s.visitedSet.has(t));
+  if (!choices.length) choices = pool.filter(t=>graph.has(t) && t!==s.current);
+
+  // softly avoid the other snake's current/target
+  const other = key==='green' ? snakes.orange : snakes.green;
+  if (other){
+    const banned = new Set([other.current, other.target]);
+    const filtered = choices.filter(t=>!banned.has(t));
+    if (filtered.length) choices = filtered;
+  }
+
+  // if still nothing, synthesize a neighbor to keep motion alive
+  if (!choices.length){
+    const synth = `${s.current}•${Math.floor(random(10000))}`;
+    addNode(synth);
+    const cnode = graph.get(s.current);
+    setNodePos(synth, (cnode.lat||0)+random(-0.3,0.3), wrapPI((cnode.lon||0)+random(-0.6,0.6)));
+    cnode.links = (cnode.links||[]).concat([synth]);
+    choices = [synth];
+  }
+
+  const pick = random(choices);
+  if (pick){ startSnakePath(s, s.current, pick); s.lastStart = millis(); }
+}
+
+function updateSnakes(){
+  const now = millis();
+
+  // watchdog: if idle for a bit, nudge each snake independently
+  for (const key of ['green','orange']){
+    const s = snakes[key];
+    if (!s.path && s.current && now - s.lastStart > 2500){
+      chooseNextTargetFor(key);
+    }
+  }
+
+  for (const key of ['green','orange']){
+    const s = snakes[key];
+    if (!s.path) continue;
+    let v = s.speed; if (s.behaviour==='limp') v *= 0.7 + 0.3*(0.5+0.5*sin(frameCount*0.07));
+    s.path.t += v;
+    if (s.path.t >= 1){
+      s.current = s.target;
+      s.path = null;
+      onSnakeArrive(key, s.current);
+      setTimeout(()=>chooseNextTargetFor(key), 150);
+    }
+  }
+}
+
+async function onSnakeArrive(key, title){
+  snakes[key].visitedSet.add(title);
+  if (!snakes[key].visitedSeq.includes(title)) snakes[key].visitedSeq.push(title);
+  // persist first color assigned
+  const n = graph.get(title); if (n && n.color === null) n.color = key;
+
+  try{
+    const res = await fetch('https://en.wikipedia.org/api/rest_v1/page/summary/'+encodeURIComponent(title), {headers:{'Accept':'application/json'}});
+    const data = await res.json();
+    updateText(key, title, data.extract || '');
+  }catch(e){
+    updateText(key, title, title);
+  }
+  expandFrom(title);
+}
+
+function drawSnakes(){
+  for (const key of ['green','orange']){
+    const s = snakes[key]; if (!s.current && !s.path) continue;
+    let p;
+    if (s.path){ p = arcPointAB(s.path.a, s.path.b, s.path.t, s.path.h, key==='green'); }
+    else { p = graph.get(s.current).pos.copy(); }
+
+    // trail
+    s.trail.push({p:p.copy(), a:255}); if (s.trail.length>450) s.trail.shift();
+    for (let i=0;i<s.trail.length;i++) s.trail[i].a *= 0.986;
+
+    stroke(s.colour[0], s.colour[1], s.colour[2], 120); noFill();
+    beginShape(); for (const t of s.trail){ stroke(s.colour[0], s.colour[1], s.colour[2], t.a); vertex(t.p.x,t.p.y,t.p.z); } endShape();
+
+    // head
+    push(); translate(p.x,p.y,p.z); stroke(s.colour[0], s.colour[1], s.colour[2], 230); sphere(2.6,8,6); pop();
+  }
+}
+
+// lifted great-circle-ish arc for graceful flight
+function arcPointAB(p0, p1, t, h, limp){
+  const a = p5.Vector.normalize(p0.copy()), b = p5.Vector.normalize(p1.copy());
+  const omega = acos(constrain(a.dot(b), -1, 1)); const so = sin(omega);
+  const dir = so<1e-6 ? a.copy()
+    : p5.Vector.add( p5.Vector.mult(a, sin((1-t)*omega)/so), p5.Vector.mult(b, sin(t*omega)/so) ).normalize();
+  let lift = h * sin(PI*t); if (limp) lift *= (0.85 + 0.3*noise(0.01*frameCount + t*8));
+  return p5.Vector.mult(dir, globeR + lift);
+}
+
+/* ========================= Scrabble-like Wireframe Cities ========================= */
+/* Electric violet (#8F00FF) city panes at left (-1) and right (+1).
+   They are bounded by a grid so they never run off-screen. */
+function drawCity(key, side){
+  const s = snakes[key]; if(!s) return;
+  const seq = s.visitedSeq || []; if(seq.length===0) return;
+
+  // Draw in screen space aligned with CSS columns
+  push();
+  resetMatrix();
+  ortho(-width/2, width/2, -height/2, height/2, -1000, 1000);
+  translate(-width/2, -height/2, 0); // origin = top-left
+
+  // Sidebar geometry from CSS
+  const SIDEBAR_X = 12;     // left/right offset
+  const SIDEBAR_W = 240;    // exact sidebar width
+  const TOP = 56;           // .visit top
+  const BOTTOM = height - 56; // .visit bottom
+  const availableH = Math.max(0, BOTTOM - TOP);
+
+  // Match column scroll height but never exceed visible area
+  const elemId = (key === 'green') ? 'visited-green' : 'visited-orange';
+  const el = document.getElementById(elemId);
+  const paneH = Math.max(140, Math.min(el ? el.scrollHeight : availableH, availableH));
+  const paneW = SIDEBAR_W;
+
+  // Pane anchor directly under column
+  const paneX = (side === -1) ? SIDEBAR_X : (width - SIDEBAR_X - paneW - 20);
+  const paneY = TOP;
+
+  // --- Scrabble-style layout grid ---
+  const cols = 10;
+  const tile = paneW / cols;
+  const vGap = 1.2;
+  const rows = Math.max(1, Math.floor(paneH / (tile * vGap)));
+
+  // Build crossword-like occupancy using newest titles first
+  const words = seq.slice(-20).map(w => (w||'').toUpperCase().replace(/[^A-Z0-9]/g,'')).filter(w=>w.length>0).reverse();
+  const grid = buildCrossGrid(words, cols, rows);
+
+  // Render every filled cell as a violet wireframe tower
+  stroke(143,0,255, 210); noFill(); strokeWeight(1);
+  for(let y=0;y<rows;y++){
+    for(let x=0;x<cols;x++){
+      const cell = grid[y][x];
+      if(!cell) continue;
+      const ch = cell.ch;
+      const lut = (ch>='0'&&ch<='9') ? (10 + (ch.charCodeAt(0)-48)) : ((ch.charCodeAt(0)-65+1) || 1);
+      const h = map(lut, 1, 36, tile*0.6, tile*3.0);
+      const cx = paneX + (x + 0.5)*tile;
+      const cy = paneY + (y + 0.5)*tile*vGap;
+      drawWireBox2D(cx, cy, tile*0.9, tile*0.9, h);
+    }
+  }
+  pop();
+}
+
+// Build a simple crossword-like grid from an array of WORDS (newest first)
+function buildCrossGrid(words, cols, rows){
+  // grid[y][x] = { ch }
+  const grid = Array.from({length:rows},()=>Array(cols).fill(null));
+  if(!words.length) return grid;
+
+  // Helper to test & place
+  function canPlace(word, x, y, dir){ // dir: 0=H, 1=V
+    for(let i=0;i<word.length;i++){
+      const gx = x + (dir===0? i:0);
+      const gy = y + (dir===1? i:0);
+      if(gx<0||gx>=cols||gy<0||gy>=rows) return false;
+      const c = grid[gy][gx];
+      if(c && c.ch !== word[i]) return false; // conflict unless same letter
+      // Optional: keep simple—no adjacency rule beyond conflicts
+    }
+    return true;
+  }
+  function doPlace(word, x, y, dir){
+    for(let i=0;i<word.length;i++){
+      const gx = x + (dir===0? i:0);
+      const gy = y + (dir===1? i:0);
+      if(!grid[gy][gx]) grid[gy][gx] = { ch: word[i] };
+    }
+  }
+
+  // Place first word horizontally centered
+  const first = words[0];
+  let fx = Math.max(0, Math.floor((cols - first.length)/2));
+  let fy = Math.floor(rows/2);
+  if(first.length>cols) fx = 0; // truncate effect, but we'll just clamp placement
+  doPlace(first, fx, fy, 0);
+  let lastDir = 0; // start with horizontal
+
+  // Place remaining words trying to cross existing letters; alternate orientation
+  for(let wi=1; wi<words.length; wi++){
+    const w = words[wi]; if(!w) continue;
+    let placed = false;
+    const dir = 1 - lastDir; // alternate H/V
+
+    // Try every letter of w against existing grid cells for intersection
+    outer: for(let i=0;i<w.length;i++){
+      const ch = w[i];
+      for(let y=0;y<rows;y++){
+        for(let x=0;x<cols;x++){
+          const c = grid[y][x]; if(!c || c.ch!==ch) continue;
+          // Anchor so that w[i] lands on (x,y)
+          const sx = dir===0 ? x - i : x;          // start x if horizontal
+          const sy = dir===1 ? y - i : y;          // start y if vertical
+          if(canPlace(w, sx, sy, dir)){
+            doPlace(w, sx, sy, dir); placed = true; break outer;
+          }
+        }
+      }
+    }
+    if(!placed){
+      // Fallback: scan from center outward for first fit in chosen orientation
+      const cx = Math.floor(cols/2), cy = Math.floor(rows/2);
+      const radiusMax = Math.max(cols, rows);
+      for(let r=0;r<=radiusMax && !placed;r++){
+        for(let yy=cy-r; yy<=cy+r && !placed; yy++){
+          for(let xx=cx-r; xx<=cx+r && !placed; xx++){
+            const sx = dir===0 ? xx : xx; // same, just naming
+            const sy = dir===1 ? yy : yy;
+            if(canPlace(w, sx, sy, dir)){ doPlace(w, sx, sy, dir); placed=true; }
+          }
+        }
+      }
+    }
+    if(placed) lastDir = dir;
+  }
+  return grid;
+}
+
+// simple 2D isometric-ish wireframe box
+function drawWireBox2D(cx, cy, w, d, h){
+  const iso = 0.35;
+  const x0 = cx - w/2, x1 = cx + w/2;
+  const y0 = cy - d/2, y1 = cy + d/2;
+  const dz = h;
+  const ox = iso * dz, oy = -iso * dz;
+
+  // bottom face
+  line(x0,y0, x1,y0); line(x1,y0, x1,y1); line(x1,y1, x0,y1); line(x0,y1, x0,y0);
+  // top face
+  line(x0+ox,y0+oy, x1+ox,y0+oy); line(x1+ox,y0+oy, x1+ox,y1+oy);
+  line(x1+ox,y1+oy, x0+ox,y1+oy); line(x0+ox,y1+oy, x0+ox,y0+oy);
+  // pillars
+  line(x0,y0, x0+ox,y0+oy); line(x1,y0, x1+ox,y0+oy);
+  line(x1,y1, x1+ox,y1+oy); line(x0,y1, x0+ox,y1+oy);
+}
+</script>
+</body>
+</html>
