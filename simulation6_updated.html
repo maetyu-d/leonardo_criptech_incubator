@@ -1,0 +1,1161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>10k Tree Bots — Wikipedia Titles Full Sim</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #05060b;
+      color: #eee;
+      font-family: monospace;
+      overflow: hidden;
+    }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+<script>
+// 10k Tree Bots — Brutalist Feedback p5.js with real Wikipedia article titles
+// Node titles are pulled live from the Wikipedia API; topology is our simulated tree.
+
+// World & layout
+const WORLD_SIZE = 10000;
+const PLANE_HALF = WORLD_SIZE * 0.4;
+const MAX_LEVELS = 100;
+const MAX_LINKS_PER_LEVEL = 12;
+const NUM_BOTS_PER_GROUP = 100;
+const BOT_SPEED = 600;
+const BOT_RADIUS = 200;
+const TOTAL_TOWER_HEIGHT = WORLD_SIZE * 0.4;
+const LEVEL_HEIGHT_3D = TOTAL_TOWER_HEIGHT / MAX_LEVELS;
+
+let viewCols = 4;
+let viewWidth;
+let viewHeight;
+
+let SIDE_SCALE_X, SIDE_SCALE_Z;
+let MARGIN_FACTOR = 0.8;
+let ISO_MARGIN = PLANE_HALF * MARGIN_FACTOR;
+let ISO_SCALE;
+
+// Colors
+let COLOR_NODE, COLOR_NODE_ACTIVE, COLOR_BOT_ORANGE, COLOR_BOT_LIME;
+let COLOR_STRUCTURE, COLOR_TEXT, COLOR_LEVEL_OUTLINE, COLOR_BOT_FOCUS;
+let COLOR_COL_BG;
+
+// Banner / titles
+let lastOrangeTitle = "";
+let lastGreenTitle = "";
+let bannerUntilTime = 0;
+
+// Global state
+let nodesOrange = [];
+let nodesGreen = [];
+let botsOrange = [];
+let botsGreen = [];
+let structOrange = [];
+let structGreen = [];
+let linksOrange = [];
+let linksGreen = [];
+let curLvlOrange = 0;
+let curLvlGreen = 0;
+let tgtOrange = null;
+let tgtGreen = null;
+let builtOrange = 0;
+let builtGreen = 0;
+let prunedOrange = false;
+let prunedGreen = false;
+let paused = false;
+
+const NUM_DUST = 400;
+let dustParticles = [];
+
+// Wikipedia helpers
+const WIKI_BASE = "https://en.wikipedia.org/w/api.php";
+
+async function getWikiTitlesFromRandomSource(count) {
+  try {
+    const rootUrl = WIKI_BASE + "?action=query&list=random&rnnamespace=0&rnlimit=1&format=json&origin=*";
+    const rootResp = await fetch(rootUrl);
+    const rootData = await rootResp.json();
+    const rootTitleRaw = (rootData.query.random[0].title || "");
+    const rootTitle = rootTitleRaw.trim();
+
+    const linksUrl = WIKI_BASE + "?action=query&prop=links&plnamespace=0&pllimit=max&format=json&origin=*&titles=" +
+                     encodeURIComponent(rootTitle || "Wikipedia");
+    const linksResp = await fetch(linksUrl);
+    const linksData = await linksResp.json();
+    const pages = linksData.query && linksData.query.pages ? linksData.query.pages : null;
+    let titles = [];
+    if (pages) {
+      for (const pid in pages) {
+        const p = pages[pid];
+        if (p.links && p.links.length) {
+          titles = p.links
+            .map(l => (l.title || "").trim())
+            .filter(t => t.length > 0);
+          break;
+        }
+      }
+    }
+
+    // Also allow the root article itself as a valid, named title
+    if (rootTitle.length > 0) {
+      titles.unshift(rootTitle);
+    }
+
+    // Do NOT synthesise any titles here; just return what we have
+    titles = titles
+      .map(t => (t || "").trim())
+      .filter(t => t.length > 0);
+
+    return shuffle(titles, true).slice(0, count);
+  } catch (e) {
+    console.warn("Wikipedia fetch failed, returning no titles:", e);
+    return [];
+  }
+}
+
+function applyWikiTitlesToLevel(nodesForLevel, tag, levelIndex) {
+  const count = nodesForLevel.length;
+  (async () => {
+    let titles = [];
+    let attempts = 0;
+
+    // Try a few times to get real, named Wikipedia titles
+    while (attempts < 5 && titles.length < count) {
+      let t = await getWikiTitlesFromRandomSource(count);
+      t = t
+        .map(v => (v || "").trim())
+        .filter(v => v.length > 0);
+
+      if (t.length > 0) {
+        titles = t;
+        break;
+      }
+      attempts++;
+    }
+
+    if (!titles.length) {
+      console.warn(`Skipping level ${levelIndex} (${tag}) — no named Wikipedia titles found.`);
+      // Drop all nodes on this level so they are never used or shown
+      nodesForLevel.length = 0;
+      return;
+    }
+
+    const usable = Math.min(nodesForLevel.length, titles.length);
+
+    for (let i = 0; i < usable; i++) {
+      nodesForLevel[i].title = titles[i];
+    }
+
+    // Remove any nodes that would have needed synthetic titles
+    if (usable < nodesForLevel.length) {
+      nodesForLevel.length = usable;
+    }
+  })();
+}
+
+// -------------------- CLASSES --------------------
+
+class Node {
+  constructor(title, x, y, level) {
+    this.title = title;
+    this.x = x;
+    this.y = y;
+    this.level = level;
+    this.childrenTitles = [];
+    this.expanded = false;
+  }
+}
+
+class Bot {
+  constructor(x, y, level) {
+    this.x = x;
+    this.y = y;
+    this.level = level;
+    this.targetNode = null;
+    this.reached = false;
+    this.trail = [];
+    this.maxTrail = 40;
+  }
+  setTarget(n) {
+    this.targetNode = n;
+    this.reached = false;
+    this.trail = [];
+    this.level = n.level;
+  }
+  update(dt) {
+    if (!this.targetNode || this.reached) return;
+    const tx = this.targetNode.x;
+    const ty = this.targetNode.y;
+    const dx = tx - this.x;
+    const dy = ty - this.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist < 1e-6) {
+      this.reached = true;
+      return;
+    }
+    if (dist <= BOT_RADIUS) {
+      this.x = tx;
+      this.y = ty;
+      this.reached = true;
+      return;
+    }
+    let step = BOT_SPEED * dt;
+    if (step >= dist) {
+      this.x = tx;
+      this.y = ty;
+      this.reached = true;
+    } else {
+      this.x += (dx / dist) * step;
+      this.y += (dy / dist) * step;
+    }
+    this.addTrailPoint();
+  }
+  addTrailPoint() {
+    this.trail.push({ x: this.x, y: this.y, level: this.level });
+    if (this.trail.length > this.maxTrail) this.trail.shift();
+  }
+}
+
+class DisabledBot extends Bot {
+  constructor(x, y, level) {
+    super(x, y, level);
+    this.gaitPhase = random(0, TWO_PI);
+    this.gaitFreq = random(1.2, 2.0);
+    this.legDiff = random(0.12, 0.3);
+    this.fatigue = 0;
+    this.baseSpeedFactor = random(0.55, 0.75);
+    this.stumbleChance = 0.003;
+  }
+  update(dt) {
+    if (!this.targetNode || this.reached) return;
+    const tx = this.targetNode.x;
+    const ty = this.targetNode.y;
+    const dx = tx - this.x;
+    const dy = ty - this.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist < 1e-6) {
+      this.reached = true;
+      return;
+    }
+    if (dist <= BOT_RADIUS) {
+      this.x = tx;
+      this.y = ty;
+      this.reached = true;
+      return;
+    }
+
+    this.gaitPhase += this.gaitFreq * dt * TWO_PI;
+    let dirX = dx / dist;
+    let dirY = dy / dist;
+    let latX = -dirY;
+    let latY = dirX;
+
+    let wobble = Math.sin(this.gaitPhase) * this.legDiff * (0.6 + 0.6 * this.fatigue);
+    let moveX = dirX + latX * wobble;
+    let moveY = dirY + latY * wobble;
+    let mlen = Math.hypot(moveX, moveY);
+    if (mlen < 1e-6) {
+      moveX = dirX;
+      moveY = dirY;
+      mlen = 1;
+    }
+    moveX /= mlen;
+    moveY /= mlen;
+
+    let fatigueFactor = max(0.3, 1.0 - this.fatigue * 0.7);
+    let speed = BOT_SPEED * this.baseSpeedFactor * fatigueFactor;
+    let step = speed * dt;
+
+    if (random() < this.stumbleChance) {
+      moveX += latX * this.legDiff * step * 0.6;
+      moveY += latY * this.legDiff * step * 0.6;
+      let m2 = Math.hypot(moveX, moveY);
+      if (m2 > 1e-6) {
+        moveX /= m2;
+        moveY /= m2;
+      }
+    }
+
+    if (step >= dist) {
+      this.x = tx;
+      this.y = ty;
+      this.reached = true;
+    } else {
+      this.x += moveX * step;
+      this.y += moveY * step;
+    }
+
+    let effort = step * (1 + Math.abs(wobble) * 3 + this.legDiff * 2);
+    this.fatigue += effort * 0.00002;
+    if (this.fatigue > 1) this.fatigue = 1;
+
+    this.addTrailPoint();
+  }
+}
+
+class StructureSegment {
+  constructor(x, y, base, top) {
+    this.x = x;
+    this.y = y;
+    this.baseLevel = base;
+    this.topLevel = top;
+  }
+}
+
+class LinkSegment {
+  constructor(x1, y1, l1, x2, y2, l2) {
+    this.x1 = x1;
+    this.y1 = y1;
+    this.level1 = l1;
+    this.x2 = x2;
+    this.y2 = y2;
+    this.level2 = l2;
+  }
+}
+
+class Dust {
+  constructor() {
+    this.reset();
+  }
+  reset(n = null) {
+    if (n) {
+      this.x = n.x + random(-PLANE_HALF * 0.05, PLANE_HALF * 0.05);
+      this.y = n.y + random(-PLANE_HALF * 0.05, PLANE_HALF * 0.05);
+      this.level = n.level + random(-2, 2);
+    } else {
+      this.x = random(-PLANE_HALF, PLANE_HALF);
+      this.y = random(-PLANE_HALF, PLANE_HALF);
+      this.level = random(0, MAX_LEVELS - 1);
+    }
+    this.vx = random(-10, 10);
+    this.vy = random(-10, 10);
+  }
+  update(dt, attract) {
+    this.x += this.vx * dt;
+    this.y += this.vy * dt;
+    this.level += random(-0.2, 0.2);
+    if (
+      this.x < -PLANE_HALF * 1.1 || this.x > PLANE_HALF * 1.1 ||
+      this.y < -PLANE_HALF * 1.1 || this.y > PLANE_HALF * 1.1 ||
+      this.level < 0 || this.level > MAX_LEVELS - 1
+    ) {
+      if (attract && attract.length > 0 && random() < 0.7) this.reset(random(attract));
+      else this.reset();
+    }
+  }
+}
+
+// -------------------- UTILS --------------------
+
+function generateSyntheticTitles(levelIndex, count, tag) {
+  // We only use this to decide how many nodes to spawn,
+  // titles will always be replaced by real Wikipedia titles later.
+  const out = [];
+  for (let i = 0; i < count; i++) out.push("");
+  return out;
+}
+
+function layoutLevel(nodeTitles, levelIndex) {
+  const nodes = [];
+  if (!nodeTitles || nodeTitles.length === 0) return nodes;
+  const margin = PLANE_HALF * MARGIN_FACTOR;
+  for (const t of nodeTitles) {
+    const x = random(-margin, margin);
+    const y = random(-margin, margin);
+    nodes.push(new Node(t, x, y, levelIndex));
+  }
+  return nodes;
+}
+
+function initializeBots(num, level, disabled) {
+  const arr = [];
+  const jitter = PLANE_HALF * 0.1;
+  for (let i = 0; i < num; i++) {
+    const bx = random(-jitter, jitter);
+    const by = random(-jitter, jitter);
+    arr.push(disabled ? new DisabledBot(bx, by, level) : new Bot(bx, by, level));
+  }
+  return arr;
+}
+
+function assignBotsToNode(bots, node) {
+  for (const b of bots) b.setTarget(node);
+}
+
+function allBotsReached(bots) {
+  return bots.every(b => b.reached);
+}
+
+function anyBotReached(bots) {
+  return bots.some(b => b.reached);
+}
+
+function chooseTarget(nodesPerLevel, levelIndex) {
+  if (levelIndex >= nodesPerLevel.length) return null;
+  const lvlNodes = nodesPerLevel[levelIndex];
+  if (!lvlNodes || lvlNodes.length === 0) return null;
+  return random(lvlNodes);
+}
+
+function levelToHeight(levelIndex) {
+  return levelIndex * LEVEL_HEIGHT_3D;
+}
+
+// projections
+function isoProject(x, y, levelIndex, colIndex) {
+  const z = levelToHeight(levelIndex);
+  const isoX = x - y;
+  const isoY = (x + y) * 0.5 - z * 1.2;
+  const ix = isoX * ISO_SCALE;
+  const iy = isoY * ISO_SCALE;
+  const sx = colIndex * viewWidth + viewWidth / 2 + ix;
+  const sy = height * 0.75 + iy;
+  return { x: sx, y: sy };
+}
+
+function sideProject(x, y, levelIndex, colIndex) {
+  const z = levelToHeight(levelIndex);
+  const sx = colIndex * viewWidth + viewWidth / 2 + x * SIDE_SCALE_X;
+  const sy = height * 0.8 - z * SIDE_SCALE_Z;
+  return { x: sx, y: sy };
+}
+
+// depth fade
+function depthAlpha(levelIndex) {
+  const t = constrain(levelIndex / (MAX_LEVELS - 1), 0, 1);
+  return 1.0 - 0.85 * t;
+}
+
+// -------------------- DRAW HELPERS --------------------
+
+function drawColumnBackgrounds() {
+  noStroke();
+  for (let c = 0; c < viewCols; c++) {
+    fill(red(COLOR_COL_BG[c]), green(COLOR_COL_BG[c]), blue(COLOR_COL_BG[c]), 60);
+    rect(c * viewWidth, 0, viewWidth, height);
+  }
+  stroke(80, 80, 100, 200);
+  strokeWeight(2);
+  for (let c = 0; c <= viewCols; c++) {
+    const x = c * viewWidth;
+    line(x, 0, x, height);
+  }
+  stroke(40, 40, 60, 60);
+  strokeWeight(1);
+  for (let y = 80; y < height; y += 40) {
+    line(0, y, width, y);
+  }
+}
+
+function drawLevelOutlineSide(levelIndex, colIndex) {
+  const xLeft = -PLANE_HALF * MARGIN_FACTOR;
+  const xRight = PLANE_HALF * MARGIN_FACTOR;
+  const p1 = sideProject(xLeft, 0, levelIndex, colIndex);
+  const p2 = sideProject(xRight, 0, levelIndex, colIndex);
+  const a = depthAlpha(levelIndex);
+  stroke(red(COLOR_LEVEL_OUTLINE), green(COLOR_LEVEL_OUTLINE), blue(COLOR_LEVEL_OUTLINE), 80 * a);
+  strokeWeight(1);
+  line(p1.x, p1.y, p2.x, p2.y);
+}
+
+function drawLevelOutlineIso(levelIndex, colIndex) {
+  const r = PLANE_HALF * MARGIN_FACTOR;
+  const corners = [
+    { x: 0, y: -r },
+    { x: r, y: 0 },
+    { x: 0, y: r },
+    { x: -r, y: 0 }
+  ];
+  const pts = corners.map(c => isoProject(c.x, c.y, levelIndex, colIndex));
+  const a = depthAlpha(levelIndex);
+  noFill();
+  stroke(red(COLOR_LEVEL_OUTLINE), green(COLOR_LEVEL_OUTLINE), blue(COLOR_LEVEL_OUTLINE), 80 * a);
+  strokeWeight(1);
+  beginShape();
+  for (const p of pts) vertex(p.x, p.y);
+  endShape(CLOSE);
+}
+
+function drawNodeGlow(px, py, isActive, baseRadius, levelIndex) {
+  const depth = depthAlpha(levelIndex);
+  noStroke();
+  if (isActive) {
+    for (let i = 4; i >= 1; i--) {
+      const rr = baseRadius * i * 1.6;
+      const alpha = 14 * i * depth;
+      fill(255, 255, 255, alpha);
+      ellipse(px, py, rr, rr);
+    }
+    fill(red(COLOR_NODE_ACTIVE), green(COLOR_NODE_ACTIVE), blue(COLOR_NODE_ACTIVE), 220 * depth);
+    ellipse(px, py, baseRadius * 1.8, baseRadius * 1.8);
+  } else {
+    for (let i = 3; i >= 1; i--) {
+      const rr = baseRadius * i * 1.4;
+      const alpha = 12 * i * depth;
+      fill(130, 190, 255, alpha);
+      ellipse(px, py, rr, rr);
+    }
+    fill(red(COLOR_NODE), green(COLOR_NODE), blue(COLOR_NODE), 220 * depth);
+    ellipse(px, py, baseRadius * 1.5, baseRadius * 1.5);
+  }
+}
+
+function drawBotTrail(bot, projectFunc, colIndex, colorBase) {
+  if (!bot.trail || bot.trail.length < 2) return;
+  noFill();
+  beginShape();
+  for (let i = 0; i < bot.trail.length; i++) {
+    const p = bot.trail[i];
+    const sp = projectFunc(p.x, p.y, p.level, colIndex);
+    const depth = depthAlpha(p.level);
+    const t = i / (bot.trail.length - 1);
+    const a = 80 * t * depth;
+    stroke(red(colorBase), green(colorBase), blue(colorBase), a);
+    vertex(sp.x, sp.y);
+  }
+  endShape();
+}
+
+function drawBots(bots, projectFunc, colIndex, botColor) {
+  noStroke();
+  for (const b of bots) {
+    const sp = projectFunc(b.x, b.y, b.level, colIndex);
+    const cxMin = colIndex * viewWidth;
+    const cxMax = (colIndex + 1) * viewWidth;
+    if (sp.x < cxMin || sp.x > cxMax) continue;
+    const depth = depthAlpha(b.level);
+    fill(red(botColor), green(botColor), blue(botColor), 220 * depth);
+    ellipse(sp.x, sp.y, 6, 6);
+    fill(red(botColor), green(botColor), blue(botColor), 80 * depth);
+    ellipse(sp.x, sp.y, 12, 12);
+  }
+}
+
+function drawBotsFocus(bots, projectFunc, colIndex) {
+  if (!bots || bots.length === 0) return;
+  let sumX = 0, sumY = 0;
+  const lvl = bots[0].level;
+  for (const b of bots) {
+    sumX += b.x;
+    sumY += b.y;
+  }
+  const avgX = sumX / bots.length;
+  const avgY = sumY / bots.length;
+  const sp = projectFunc(avgX, avgY, lvl, colIndex);
+  const cxMin = colIndex * viewWidth;
+  const cxMax = (colIndex + 1) * viewWidth;
+  if (sp.x < cxMin || sp.x > cxMax) return;
+  const depth = depthAlpha(lvl);
+  noFill();
+  stroke(red(COLOR_BOT_FOCUS), green(COLOR_BOT_FOCUS), blue(COLOR_BOT_FOCUS), 160 * depth);
+  strokeWeight(1.5);
+  ellipse(sp.x, sp.y, 14, 14);
+}
+
+function drawChromaticLink(p1, p2, depth) {
+  const baseAlpha = 180 * depth;
+  stroke(255, 60, 80, baseAlpha * 0.7);
+  strokeWeight(2.5);
+  line(p1.x + 1.5, p1.y - 1.5, p2.x + 1.5, p2.y - 1.5);
+  stroke(60, 255, 255, baseAlpha * 0.7);
+  strokeWeight(2.5);
+  line(p1.x - 1.5, p1.y + 1.5, p2.x - 1.5, p2.y + 1.5);
+  stroke(230, 230, 255, baseAlpha);
+  strokeWeight(2);
+  line(p1.x, p1.y, p2.x, p2.y);
+}
+
+function drawStructureSegment(seg, projectFunc, colIndex) {
+  const baseDepth = depthAlpha(seg.baseLevel);
+  const topDepth = depthAlpha(seg.topLevel);
+  const d = 0.5 * (baseDepth + topDepth);
+  const p1 = projectFunc(seg.x, seg.y, seg.baseLevel, colIndex);
+  const p2 = projectFunc(seg.x, seg.y, seg.topLevel, colIndex);
+
+  // Central bright brutalist core
+  stroke(red(COLOR_STRUCTURE), green(COLOR_STRUCTURE), blue(COLOR_STRUCTURE), 255 * d);
+  strokeWeight(7);
+  line(p1.x, p1.y, p2.x, p2.y);
+
+  // Inner white glow
+  stroke(255, 255, 255, 140 * d);
+  strokeWeight(3);
+  line(p1.x, p1.y, p2.x, p2.y);
+
+  // Side rails for a thicker, architectural feel
+  const railOffset = 6;
+  stroke(180, 210, 255, 150 * d);
+  strokeWeight(2);
+  line(p1.x - railOffset, p1.y, p2.x - railOffset, p2.y);
+  line(p1.x + railOffset, p1.y, p2.x + railOffset, p2.y);
+
+  // Horizontal crossbars / floors along the segment
+  const steps = 5;
+  for (let i = 1; i < steps; i++) {
+    const t = i / steps;
+    const cx = lerp(p1.x, p2.x, t);
+    const cy = lerp(p1.y, p2.y, t);
+    const w = 22;
+    const a = 110 * d * (1.0 - 0.08 * i);
+    stroke(200, 220, 255, a);
+    strokeWeight(2);
+    line(cx - w, cy, cx + w, cy);
+  }
+}
+
+
+function drawDottedConnection(node, sideCol, isoCol) {
+  const p1 = sideProject(node.x, node.y, node.level, sideCol);
+  const p2 = isoProject(node.x, node.y, node.level, isoCol);
+
+  // confine lines to their respective columns
+  if (p1.x < sideCol * viewWidth || p1.x > (sideCol + 1) * viewWidth) return;
+  if (p2.x < isoCol * viewWidth || p2.x > (isoCol + 1) * viewWidth) return;
+
+  const d = depthAlpha(node.level);
+  stroke(255, 255, 255, 45 * d);
+  strokeWeight(1);
+
+  const steps = 22;
+  for (let i = 0; i < steps; i += 2) {
+    const t1 = i / steps;
+    const t2 = (i + 1) / steps;
+    const x1 = lerp(p1.x, p2.x, t1);
+    const y1 = lerp(p1.y, p2.y, t1);
+    const x2 = lerp(p1.x, p2.x, t2);
+    const y2 = lerp(p1.y, p2.y, t2);
+    line(x1, y1, x2, y2);
+  }
+}
+
+
+function drawCurvedConnectionGreen(node, sideCol, isoCol) {
+  const p1 = sideProject(node.x, node.y, node.level, sideCol);
+  const p2 = isoProject(node.x, node.y, node.level, isoCol);
+
+  if (p1.x < sideCol * viewWidth || p1.x > (sideCol + 1) * viewWidth) return;
+  if (p2.x < isoCol * viewWidth || p2.x > (isoCol + 1) * viewWidth) return;
+
+  const d = depthAlpha(node.level);
+
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  const len = Math.hypot(dx, dy) || 1.0;
+  const nx = -dy / len;
+  const ny = dx / len;
+
+  const mid1x = p1.x + dx * 0.28;
+  const mid1y = p1.y + dy * 0.28;
+  const mid2x = p1.x + dx * 0.55;
+  const mid2y = p1.y + dy * 0.55;
+  const mid3x = p1.x + dx * 0.82;
+  const mid3y = p1.y + dy * 0.82;
+
+  const amp = 40 * d;
+  const jitter1 = (noise(node.level * 0.31, node.x * 0.001, frameCount * 0.01) - 0.5) * 2.0;
+  const jitter2 = (noise(node.level * 0.77, node.y * 0.001, frameCount * 0.013) - 0.5) * 2.0;
+  const jitter3 = (noise(node.level * 0.51, (node.x + node.y) * 0.001, frameCount * 0.017) - 0.5) * 2.0;
+
+  const c1x = mid1x + nx * amp * (0.8 + jitter1);
+  const c1y = mid1y + ny * amp * (0.8 + jitter1);
+  const c2x = mid2x - nx * amp * (0.6 + jitter2);
+  const c2y = mid2y - ny * amp * (0.6 + jitter2);
+  const c3x = mid3x + nx * amp * (0.4 + jitter3);
+  const c3y = mid3y + ny * amp * (0.4 + jitter3);
+
+  noFill();
+  stroke(0, 255, 120, 95 * d);
+  strokeWeight(1.8);
+
+  beginShape();
+  curveVertex(p1.x, p1.y);
+  curveVertex(p1.x, p1.y);
+  curveVertex(c1x, c1y);
+  curveVertex(c2x, c2y);
+  curveVertex(c3x, c3y);
+  curveVertex(p2.x, p2.y);
+  curveVertex(p2.x, p2.y);
+  endShape();
+}
+function drawCurvedConnectionOrange(node, sideCol, isoCol) {
+  const p1 = sideProject(node.x, node.y, node.level, sideCol);
+  const p2 = isoProject(node.x, node.y, node.level, isoCol);
+
+  if (p1.x < sideCol * viewWidth || p1.x > (sideCol + 1) * viewWidth) return;
+  if (p2.x < isoCol * viewWidth || p2.x > (isoCol + 1) * viewWidth) return;
+
+  const d = depthAlpha(node.level);
+
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  const len = Math.hypot(dx, dy) || 1.0;
+  const nx = -dy / len;
+  const ny = dx / len;
+
+  const mid1x = p1.x + dx * 0.33;
+  const mid1y = p1.y + dy * 0.33;
+  const mid2x = p1.x + dx * 0.66;
+  const mid2y = p1.y + dy * 0.66;
+
+  const amp = 30 * d;
+  const t = millis() / 1000.0;
+  const slow = t * 0.35;
+  const osc1 = Math.sin(slow + node.level * 0.4) * 0.6;
+  const osc2 = Math.sin(slow * 0.9 + node.level * 0.7) * 0.5;
+
+  const c1x = mid1x + nx * amp * (1.0 + osc1);
+  const c1y = mid1y + ny * amp * (1.0 + osc1);
+  const c2x = mid2x - nx * amp * (0.7 + osc2);
+  const c2y = mid2y - ny * amp * (0.7 + osc2);
+
+  noFill();
+  stroke(255,140,0, 90 * d); // orange
+  strokeWeight(1.8);
+
+  beginShape();
+  curveVertex(p1.x, p1.y);
+  curveVertex(p1.x, p1.y);
+  curveVertex(c1x, c1y);
+  curveVertex(c2x, c2y);
+  curveVertex(p2.x, p2.y);
+  curveVertex(p2.x, p2.y);
+  endShape();
+}
+
+
+function drawDust(projectFunc, colIndex) {
+  noStroke();
+  for (const d of dustParticles) {
+    const depth = depthAlpha(Math.floor(d.level));
+    const sp = projectFunc(d.x, d.y, d.level, colIndex);
+    fill(200, 220, 255, 40 * depth);
+    rect(sp.x, sp.y, 2, 2);
+  }
+}
+
+function evalCubicPoint(p0, p1, p2, p3, t) {
+  const u = 1 - t;
+  const uu = u * u;
+  const tt = t * t;
+  const uuu = uu * u;
+  const ttt = tt * t;
+  const x = uuu * p0.x + 3 * uu * t * p1.x + 3 * u * tt * p2.x + ttt * p3.x;
+  const y = uuu * p0.y + 3 * uu * t * p1.y + 3 * u * tt * p2.y + ttt * p3.y;
+  return { x, y };
+}
+
+function drawPulseOnCurve(node, sideCol, isoCol, bots, col) {
+  const p1 = sideProject(node.x, node.y, node.level, sideCol);
+  const p2 = isoProject(node.x, node.y, node.level, isoCol);
+
+  if (p1.x < sideCol * viewWidth || p1.x > (sideCol + 1) * viewWidth) return;
+  if (p2.x < isoCol * viewWidth || p2.x > (isoCol + 1) * viewWidth) return;
+
+  // Only pulse when all bots for this node have reached the target
+  const allReached = bots && bots.length > 0 && bots.every(b => b.reached);
+  if (!allReached) return;
+
+  const d = depthAlpha(node.level);
+
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  const len = Math.hypot(dx, dy) || 1.0;
+  const nx = -dy / len;
+  const ny = dx / len;
+
+  const mid1x = p1.x + dx * 0.33;
+  const mid1y = p1.y + dy * 0.33;
+  const mid2x = p1.x + dx * 0.66;
+  const mid2y = p1.y + dy * 0.66;
+
+  const amp = 35 * d;
+  const c1 = { x: mid1x + nx * amp, y: mid1y + ny * amp };
+  const c2 = { x: mid2x - nx * amp * 0.8, y: mid2y - ny * amp * 0.8 };
+
+  const base = millis() / 1000.0;
+  const pulses = 3;
+  for (let i = 0; i < pulses; i++) {
+    const phase = base * 0.6 + i * 0.33;
+    let t = phase % 1.0;
+    const pt = evalCubicPoint(p1, c1, c2, p2, t);
+
+    noStroke();
+    const r = 4 + 2 * Math.sin(base * 4 + i);
+    fill(red(col), green(col), blue(col), 120 * d);
+    ellipse(pt.x, pt.y, r, r);
+  }
+}
+
+// -------------------- SCENE --------------------
+
+function drawScene() {
+  drawColumnBackgrounds();
+
+  const orangeTitle = tgtOrange ? tgtOrange.title : "None";
+  const greenTitle = tgtGreen ? tgtGreen.title : "None";
+
+  // ORANGE SIDE (col 0)
+  let col = 0;
+  drawDust(sideProject, col);
+  for (let lvl = 0; lvl < nodesOrange.length; lvl++) {
+    if (!nodesOrange[lvl] || nodesOrange[lvl].length === 0) continue;
+    drawLevelOutlineSide(lvl, col);
+  }
+  for (const seg of structOrange) drawStructureSegment(seg, sideProject, col);
+  for (const link of linksOrange) {
+    const p1 = sideProject(link.x1, link.y1, link.level1, col);
+    const p2 = sideProject(link.x2, link.y2, link.level2, col);
+    const depth = 0.5 * (depthAlpha(link.level1) + depthAlpha(link.level2));
+    drawChromaticLink(p1, p2, depth);
+  }
+  for (const lvlNodes of nodesOrange) {
+    for (const node of lvlNodes) {
+      const sp = sideProject(node.x, node.y, node.level, col);
+      const cxMin = col * viewWidth, cxMax = (col + 1) * viewWidth;
+      if (sp.x < cxMin || sp.x > cxMax) continue;
+      drawNodeGlow(sp.x, sp.y, node === tgtOrange, 4, node.level);
+    }
+  }
+  for (const b of botsOrange) drawBotTrail(b, sideProject, col, COLOR_BOT_ORANGE);
+  drawBots(botsOrange, sideProject, col, COLOR_BOT_ORANGE);
+  drawBotsFocus(botsOrange, sideProject, col);
+  fill(COLOR_TEXT);
+  noStroke();
+  textAlign(LEFT, TOP);
+  textSize(14);
+  text("orange (side)", 5, 5);
+  text("active: " + orangeTitle, 5, 25);
+
+  // ORANGE ISO (col 1)
+  col = 1;
+  drawDust(isoProject, col);
+  for (let lvl = 0; lvl < nodesOrange.length; lvl++) {
+    if (!nodesOrange[lvl] || nodesOrange[lvl].length === 0) continue;
+    drawLevelOutlineIso(lvl, col);
+  }
+  for (const seg of structOrange) drawStructureSegment(seg, isoProject, col);
+  for (const link of linksOrange) {
+    const p1 = isoProject(link.x1, link.y1, link.level1, col);
+    const p2 = isoProject(link.x2, link.y2, link.level2, col);
+    const depth = 0.5 * (depthAlpha(link.level1) + depthAlpha(link.level2));
+    drawChromaticLink(p1, p2, depth);
+  }
+  for (const lvlNodes of nodesOrange) {
+    for (const node of lvlNodes) {
+      const sp = isoProject(node.x, node.y, node.level, col);
+      const cxMin = col * viewWidth, cxMax = (col + 1) * viewWidth;
+      if (sp.x < cxMin || sp.x > cxMax) continue;
+      drawNodeGlow(sp.x, sp.y, node === tgtOrange, 5, node.level);
+    }
+  }
+  for (const b of botsOrange) drawBotTrail(b, isoProject, col, COLOR_BOT_ORANGE);
+  drawBots(botsOrange, isoProject, col, COLOR_BOT_ORANGE);
+  drawBotsFocus(botsOrange, isoProject, col);
+  fill(COLOR_TEXT);
+  noStroke();
+  text("orange (iso)", viewWidth + 5, 5);
+  text("active: " + orangeTitle, viewWidth + 5, 25);
+
+  // GREEN SIDE (col 2)
+  col = 2;
+  drawDust(sideProject, col);
+  for (let lvl = 0; lvl < nodesGreen.length; lvl++) {
+    if (!nodesGreen[lvl] || nodesGreen[lvl].length === 0) continue;
+    drawLevelOutlineSide(lvl, col);
+  }
+  for (const seg of structGreen) drawStructureSegment(seg, sideProject, col);
+  for (const link of linksGreen) {
+    const p1 = sideProject(link.x1, link.y1, link.level1, col);
+    const p2 = sideProject(link.x2, link.y2, link.level2, col);
+    const depth = 0.5 * (depthAlpha(link.level1) + depthAlpha(link.level2));
+    drawChromaticLink(p1, p2, depth);
+  }
+  for (const lvlNodes of nodesGreen) {
+    for (const node of lvlNodes) {
+      const sp = sideProject(node.x, node.y, node.level, col);
+      const cxMin = col * viewWidth, cxMax = (col + 1) * viewWidth;
+      if (sp.x < cxMin || sp.x > cxMax) continue;
+      drawNodeGlow(sp.x, sp.y, node === tgtGreen, 4, node.level);
+    }
+  }
+  for (const b of botsGreen) drawBotTrail(b, sideProject, col, COLOR_BOT_LIME);
+  drawBots(botsGreen, sideProject, col, COLOR_BOT_LIME);
+  drawBotsFocus(botsGreen, sideProject, col);
+  fill(COLOR_TEXT);
+  noStroke();
+  text("green (side)", 2 * viewWidth + 5, 5);
+  text("active: " + greenTitle, 2 * viewWidth + 5, 25);
+
+  // GREEN ISO (col 3)
+  col = 3;
+  drawDust(isoProject, col);
+  for (let lvl = 0; lvl < nodesGreen.length; lvl++) {
+    if (!nodesGreen[lvl] || nodesGreen[lvl].length === 0) continue;
+    drawLevelOutlineIso(lvl, col);
+  }
+  for (const seg of structGreen) drawStructureSegment(seg, isoProject, col);
+  for (const link of linksGreen) {
+    const p1 = isoProject(link.x1, link.y1, link.level1, col);
+    const p2 = isoProject(link.x2, link.y2, link.level2, col);
+    const depth = 0.5 * (depthAlpha(link.level1) + depthAlpha(link.level2));
+    drawChromaticLink(p1, p2, depth);
+  }
+  for (const lvlNodes of nodesGreen) {
+    for (const node of lvlNodes) {
+      const sp = isoProject(node.x, node.y, node.level, col);
+      const cxMin = col * viewWidth, cxMax = (col + 1) * viewWidth;
+      if (sp.x < cxMin || sp.x > cxMax) continue;
+      drawNodeGlow(sp.x, sp.y, node === tgtGreen, 5, node.level);
+    }
+  }
+  for (const b of botsGreen) drawBotTrail(b, isoProject, col, COLOR_BOT_LIME);
+  drawBots(botsGreen, isoProject, col, COLOR_BOT_LIME);
+  drawBotsFocus(botsGreen, isoProject, col);
+  fill(COLOR_TEXT);
+  noStroke();
+  text("green (iso)", 3 * viewWidth + 5, 5);
+  text("active: " + greenTitle, 3 * viewWidth + 5, 25);
+
+    // connector lines between side and iso views
+  // Only show splines for ACTIVE node paths, with pulsing when bots reach target
+  if (tgtOrange) {
+    drawCurvedConnectionOrange(tgtOrange, 0, 1);
+    drawPulseOnCurve(tgtOrange, 0, 1, botsOrange, COLOR_BOT_ORANGE);
+  }
+  if (tgtGreen) {
+    drawCurvedConnectionGreen(tgtGreen, 2, 3);
+    drawPulseOnCurve(tgtGreen, 2, 3, botsGreen, COLOR_BOT_LIME);
+  }
+
+  // -------- FULL-WIDTH TOP TITLES (FULL WIKIPEDIA TITLES, COLOURED) --------
+  textAlign(CENTER, CENTER);
+  textSize(22);
+
+  noStroke();
+  fill(0, 0, 0, 235);
+  rect(0, 0, width, 52);
+
+  const gap = "        |        ";
+  const orangeLabel = "" + orangeTitle;
+  const greenLabel  = ""  + greenTitle;
+  const full = orangeLabel + gap + greenLabel;
+
+  fill(0, 0, 0, 180);
+  text(full, width / 2 + 2, 26 + 2);
+
+  const fullWidth = textWidth(full);
+  let offset = width / 2 - fullWidth / 2;
+
+  fill(255, 140, 0);
+  textAlign(LEFT, CENTER);
+  text(orangeLabel, offset, 26);
+
+  offset += textWidth(orangeLabel + gap);
+
+  fill(0, 255, 120);
+  text(greenLabel, offset, 26);
+
+  // -------- BOTTOM INFO + BANNER --------
+  textAlign(LEFT, TOP);
+  textSize(14);
+  const botsAtTargetOrange = botsOrange.filter(b => b.reached).length;
+  const botsAtTargetGreen = botsGreen.filter(b => b.reached).length;
+  const infoLines = [
+    "",
+    `L${curLvlOrange + 1}/${MAX_LEVELS} | built ${builtOrange} | bots ${botsAtTargetOrange}/${botsOrange.length}`,
+    `L${curLvlGreen + 1}/${MAX_LEVELS} | built ${builtGreen} | bots ${botsAtTargetGreen}/${botsGreen.length}`,
+    "SPACE: pause / play"
+  ];
+  let yy = height - 22 * infoLines.length - 40;
+  for (const line of infoLines) {
+    fill(235, 235, 245, 230);
+    text(line, 10, yy);
+    yy += 22;
+  }
+
+  const now = millis() / 1000.0;
+  if (orangeTitle !== lastOrangeTitle || greenTitle !== lastGreenTitle) {
+    lastOrangeTitle = orangeTitle;
+    lastGreenTitle = greenTitle;
+    bannerUntilTime = now + 1.0;
+  }
+  if (now <= bannerUntilTime) {
+    const banner = `${orangeTitle}    |    ${greenTitle}`;
+    const btw = textWidth(banner);
+    const bbx = (width - btw) / 2;
+    const bby = height - 24;
+    noStroke();
+    fill(0, 0, 0, 200);
+    rect(bbx - 12, bby - 6, btw + 24, 24, 4);
+    fill(255);
+    textAlign(LEFT, TOP);
+    text(banner, bbx, bby - 2);
+  }
+}
+
+// -------------------- TREE STEP --------------------
+
+function stepTree(nodes, bots, structArr, linksArr, curLvl, tgt, built, pruned, tag) {
+  if (!pruned && anyBotReached(bots) && tgt) {
+    if (curLvl > 0 && nodes[curLvl - 1].length === 1) {
+      const prevNode = nodes[curLvl - 1][0];
+      linksArr.push(new LinkSegment(prevNode.x, prevNode.y, prevNode.level, tgt.x, tgt.y, tgt.level));
+    }
+    nodes[curLvl] = [tgt];
+    pruned = true;
+  }
+  if (allBotsReached(bots)) {
+    if (built < MAX_LEVELS - 1) {
+      const baseLevel = curLvl;
+      const topLevel = curLvl + 1;
+      structArr.push(new StructureSegment(tgt.x, tgt.y, baseLevel, topLevel));
+      built++;
+      let children;
+      if (!tgt.childrenTitles || tgt.childrenTitles.length === 0) {
+        children = generateSyntheticTitles(curLvl + 1, MAX_LINKS_PER_LEVEL, tag);
+        tgt.childrenTitles = children;
+        tgt.expanded = true;
+      } else {
+        children = tgt.childrenTitles;
+      }
+      const nextLevelIndex = curLvl + 1;
+      if (nextLevelIndex >= nodes.length) {
+        const unique = [...new Set(children)].slice(0, MAX_LINKS_PER_LEVEL);
+        const nextNodes = layoutLevel(unique, nextLevelIndex);
+        for (const n of nextNodes) n.childrenTitles = [];
+        nodes.push(nextNodes);
+
+        applyWikiTitlesToLevel(nextNodes, tag, nextLevelIndex);
+      }
+      curLvl = nextLevelIndex;
+      const jitter = PLANE_HALF * 0.1;
+      for (const b of bots) {
+        b.x = tgt.x + random(-jitter, jitter);
+        b.y = tgt.y + random(-jitter, jitter);
+        b.level = curLvl;
+        b.reached = false;
+        b.trail = [];
+        if (b instanceof DisabledBot) b.fatigue *= 0.5;
+      }
+      tgt = chooseTarget(nodes, curLvl);
+      if (tgt) assignBotsToNode(bots, tgt);
+      pruned = false;
+    }
+  }
+  return { nodes, bots, structArr, linksArr, curLvl, tgt, built, pruned };
+}
+
+// -------------------- P5 SETUP / DRAW / RESIZE --------------------
+
+function setup() {
+  createCanvas(windowWidth, windowHeight);
+  recalcView();
+  frameRate(60);
+  smooth(8);
+
+  textFont("monospace", 14);
+
+  COLOR_NODE = color(90, 170, 255);
+  COLOR_NODE_ACTIVE = color(255, 255, 255);
+  COLOR_BOT_ORANGE = color(255, 140, 0);
+  COLOR_BOT_LIME = color(0, 255, 120);
+  COLOR_STRUCTURE = color(240, 240, 240);
+  COLOR_TEXT = color(235, 235, 245);
+  COLOR_LEVEL_OUTLINE = color(80, 80, 110);
+  COLOR_BOT_FOCUS = color(255, 60, 60);
+  COLOR_COL_BG = [
+    color(18, 18, 32),
+    color(26, 16, 40),
+    color(12, 26, 36),
+    color(36, 34, 18)
+  ];
+
+  const rootTitlesOrange = generateSyntheticTitles(0, MAX_LINKS_PER_LEVEL, "Orange");
+  const level0Orange = layoutLevel(rootTitlesOrange, 0);
+  for (const n of level0Orange) n.childrenTitles = [];
+  nodesOrange.push(level0Orange);
+  applyWikiTitlesToLevel(level0Orange, "Orange", 0);
+
+  const rootTitlesGreen = generateSyntheticTitles(0, MAX_LINKS_PER_LEVEL, "Green");
+  const level0Green = layoutLevel(rootTitlesGreen, 0);
+  for (const n of level0Green) n.childrenTitles = [];
+  nodesGreen.push(level0Green);
+  applyWikiTitlesToLevel(level0Green, "Green", 0);
+
+  botsOrange = initializeBots(NUM_BOTS_PER_GROUP, 0, false);
+  botsGreen = initializeBots(NUM_BOTS_PER_GROUP, 0, true);
+
+  tgtOrange = chooseTarget(nodesOrange, curLvlOrange);
+  tgtGreen = chooseTarget(nodesGreen, curLvlGreen);
+  if (tgtOrange) assignBotsToNode(botsOrange, tgtOrange);
+  if (tgtGreen) assignBotsToNode(botsGreen, tgtGreen);
+
+  for (let i = 0; i < NUM_DUST; i++) dustParticles.push(new Dust());
+}
+
+function recalcView() {
+  viewWidth = width / viewCols;
+  viewHeight = height;
+  SIDE_SCALE_X = (viewWidth * 0.45) / PLANE_HALF;
+  SIDE_SCALE_Z = (height * 0.7) / TOTAL_TOWER_HEIGHT;
+  ISO_MARGIN = PLANE_HALF * MARGIN_FACTOR;
+  ISO_SCALE = (viewWidth * 0.45) / (2.0 * ISO_MARGIN * 2.0);
+}
+
+function draw() {
+  noStroke();
+  fill(5, 6, 12, 40);
+  rect(0, 0, width, height);
+
+  let dt = deltaTime / 1000.0;
+  dt = min(dt, 1.0 / 60.0);
+
+  if (!paused) {
+    for (const b of botsOrange) b.update(dt);
+    for (const b of botsGreen) b.update(dt);
+    const attract = [];
+    if (tgtOrange) attract.push(tgtOrange);
+    if (tgtGreen) attract.push(tgtGreen);
+    for (const d of dustParticles) d.update(dt, attract);
+
+    let resO = stepTree(nodesOrange, botsOrange, structOrange, linksOrange, curLvlOrange, tgtOrange, builtOrange, prunedOrange, "Orange");
+    nodesOrange = resO.nodes;
+    botsOrange = resO.bots;
+    structOrange = resO.structArr;
+    linksOrange = resO.linksArr;
+    curLvlOrange = resO.curLvl;
+    tgtOrange = resO.tgt;
+    builtOrange = resO.built;
+    prunedOrange = resO.pruned;
+
+    let resG = stepTree(nodesGreen, botsGreen, structGreen, linksGreen, curLvlGreen, tgtGreen, builtGreen, prunedGreen, "Green");
+    nodesGreen = resG.nodes;
+    botsGreen = resG.bots;
+    structGreen = resG.structArr;
+    linksGreen = resG.linksArr;
+    curLvlGreen = resG.curLvl;
+    tgtGreen = resG.tgt;
+    builtGreen = resG.built;
+    prunedGreen = resG.pruned;
+  }
+
+  drawScene();
+}
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+  recalcView();
+}
+
+function keyPressed() {
+  if (key === ' ') paused = !paused;
+}
+</script>
+</body>
+</html>
