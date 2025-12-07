@@ -1,0 +1,1 @@
+limp.freq was developed as part of the Leonardo/ISAST CripTech AI Incubator from July to November 2025, for the virtual exhibition Slow AI (https://leonardo.info/slow-ai/). Special thanks to M Eilo, the team at Leonardo (Vanessa Chang, Jason Lam, Maya Hilbert, Claudia Alick), and all who gave feedback over the weeks.
