@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Minimal RC Line-Car — adjustable right wheels</title>
+  <style>
+    html, body { height: 100%; margin: 0; background: #000; color: #fff; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    #sliderContainer { display:none; position: fixed; top: 20px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.85); color: #fff; padding: 10px 14px; border-radius: 8px; font-size: 28px; border: 1px solid rgba(255,255,255,0.2); }
+    .overlay { position: fixed; left: 50%; transform: translateX(-50%); width: min(900px, 80vw); text-align: center; color: #fff; padding: 8px 10px; font-size: 32px; }
+    .lower-third { top: calc(66vh); } /* moved down by 100px */
+    .overlay.hidden { display: none; }
+    #endOverlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: black; color: white; display: flex; justify-content: center; align-items: center; font-size: 48px; text-align: center; padding: 20px; box-sizing: border-box; }
+    #endOverlay.hidden { display: none; }
+    #pressE { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 64px; font-weight: bold; color: #fff; }
+    #pressE.hidden { display: none; }
+  </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.2/p5.min.js"></script>
+</head>
+<body>
+  <div id="introOverlay" class="overlay lower-third">
+    The Up/Down arrow keys control the throttle of the toy car, Left/Right arrow keys steer. Try it out for a few moments.
+  </div>
+  <div id="phase2Overlay" class="overlay lower-third hidden">
+    The larger wheels on the right side of the car approximate the artist's leg length discrepancy (LLD). Use the slider to explore the effects of wheel asymmetry on steering and movement.
+  </div>
+
+  <div id="sliderContainer">
+    Right wheel size: <input type="range" id="wheelSlider" min="1" max="4" step="0.01" value="1.75"> <span id="wheelVal">1.75</span>x
+  </div>
+
+  <div id="pressE" class="hidden">Press 'e' to end.</div>
+  <div id="endOverlay" class="hidden">
+    <div style="max-width: 900px; margin: 0 auto;">
+      Extreme values can be fun, but did you notice how even a small asymmetry makes a big difference to how the toy car moves around the space?
+    </div>
+  </div>
+
+  <script>
+    let car, trailLayer;
+    let startTime;
+    let slider, sliderValSpan;
+    let secondPhase = false;
+    let phaseTwoStartTime = null;
+    let endState = false;
+
+    function setup() {
+      createCanvas(window.innerWidth, window.innerHeight);
+      pixelDensity(1);
+      trailLayer = createGraphics(width, height);
+      clearTrail();
+      car = new RCcar(width*0.5, height*0.5, -HALF_PI);
+      startTime = millis();
+
+      slider = document.getElementById("wheelSlider");
+      sliderValSpan = document.getElementById("wheelVal");
+      slider.addEventListener("input", () => {
+        car.rR = parseFloat(slider.value);
+        sliderValSpan.textContent = slider.value;
+      });
+
+      setTimeout(() => document.getElementById('introOverlay').classList.add('hidden'), 10000);
+    }
+
+    function windowResized() {
+      const snapshot = trailLayer.get();
+      resizeCanvas(window.innerWidth, window.innerHeight);
+      const newLayer = createGraphics(width, height);
+      newLayer.background('#000000');
+      newLayer.image(snapshot, 0, 0);
+      trailLayer = newLayer;
+    }
+
+    function draw() {
+      if (endState) return; // stop drawing when ended
+
+      if (!secondPhase && millis() - startTime > 40000) {
+        secondPhase = true;
+        phaseTwoStartTime = millis();
+        document.getElementById("sliderContainer").style.display = "block";
+        clearTrail();
+        const p2 = document.getElementById('phase2Overlay');
+        p2.classList.remove('hidden');
+        setTimeout(() => p2.classList.add('hidden'), 10000);
+      }
+
+      if (secondPhase && millis() - phaseTwoStartTime > 30000) {
+        document.getElementById('pressE').classList.remove('hidden');
+      }
+
+      image(trailLayer, 0, 0);
+
+      const throttleCmd = (keyIsDown(UP_ARROW) ? 1 : 0) + (keyIsDown(DOWN_ARROW) ? -1 : 0);
+      const steerCmd = (keyIsDown(RIGHT_ARROW) ? 1 : 0) + (keyIsDown(LEFT_ARROW) ? -1 : 0);
+
+      car.update(throttleCmd, steerCmd, deltaTime/1000);
+      car.draw();
+    }
+
+    function clearTrail(){
+      trailLayer.background('#000000');
+    }
+
+    function keyPressed(){
+      if (endState) return;
+      if (key === 'C' || key === 'c') clearTrail();
+      if (key === 'R' || key === 'r') car.reset(width*0.5, height*0.5, -HALF_PI);
+      if (key === 'E' || key === 'e') {
+        document.getElementById('pressE').classList.add('hidden');
+        document.getElementById('endOverlay').classList.remove('hidden');
+        endState = true;
+      }
+    }
+
+    class RCcar {
+      constructor(x, y, heading){
+        this.x = x; this.y = y; this.h = heading;
+        this.wheelbase = 75; // 50% bigger
+        this.bodyLen = 69;   // 50% bigger
+        this.bodyWid = 39;   // 50% bigger
+        this.rL = 1.00;
+        this.rR = 1.75;
+        this.maxWheelSpeed = 180;
+        this.accel = 7.0;
+        this.vL = 0; this.vR = 0;
+        this.tCmd = 0; this.sCmd = 0;
+        this.tSlew = 8.0;
+        this.sSlew = 12.0;
+        this.px = x; this.py = y;
+      }
+
+      reset(x, y, heading){
+        this.x = x; this.y = y; this.h = heading;
+        this.vL = this.vR = 0; this.tCmd = this.sCmd = 0;
+        this.px = x; this.py = y;
+      }
+
+      update(throttleIn, steerIn, dt){
+        const lp = (v, target, slew, dt) => v + (target - v) * (1 - Math.exp(-slew * dt));
+        this.tCmd = lp(this.tCmd, constrain(throttleIn, -1, 1), this.tSlew, dt);
+        this.sCmd = lp(this.sCmd, constrain(steerIn, -1, 1), this.sSlew, dt);
+
+        const steerMix = 0.85;
+        let targetVL = ( this.tCmd - this.sCmd * steerMix) * this.maxWheelSpeed * this.rL;
+        let targetVR = ( this.tCmd + this.sCmd * steerMix) * this.maxWheelSpeed * this.rR;
+
+        const lp2 = (v, target) => v + (target - v) * (1 - Math.exp(-this.accel * dt));
+        this.vL = lp2(this.vL, targetVL);
+        this.vR = lp2(this.vR, targetVR);
+
+        const v = (this.vL + this.vR) * 0.5;
+        const omega = (this.vR - this.vL) / this.wheelbase;
+
+        this.h += omega * dt;
+        this.x += v * Math.cos(this.h) * dt;
+        this.y += v * Math.sin(this.h) * dt;
+
+        let wrappedX = this.x;
+        let wrappedY = this.y;
+        if (this.x < 0) wrappedX = this.x + width; else if (this.x >= width) wrappedX = this.x - width;
+        if (this.y < 0) wrappedY = this.y + height; else if (this.y >= height) wrappedY = this.y - height;
+
+        // Only draw trail if movement didn't wrap (to avoid jump lines)
+        if ((wrappedX === this.x && wrappedY === this.y) || (Math.abs(this.x - this.px) < width/2 && Math.abs(this.y - this.py) < height/2)) {
+          trailLayer.push();
+          trailLayer.stroke('#33FF33');
+          trailLayer.strokeWeight(2); // twice as thick
+          trailLayer.noFill();
+          trailLayer.line(this.px, this.py, this.x, this.y);
+          trailLayer.pop();
+        }
+
+        this.x = wrappedX;
+        this.y = wrappedY;
+
+        this.px = this.x; this.py = this.y;
+      }
+
+      draw(){
+        push();
+        translate(this.x, this.y);
+        rotate(this.h);
+        stroke(255); noFill(); strokeWeight(2); // twice as thick
+        rectMode(CENTER);
+        rect(0, 0, this.bodyLen, this.bodyWid, 6);
+        const wY = this.bodyWid*0.5 + 3;
+        line(-this.bodyLen*0.32, -wY,  this.bodyLen*0.32, -wY);
+        ellipse(-this.bodyLen*0.28, -wY, 12*this.rL, 12*this.rL); // 50% bigger
+        ellipse( this.bodyLen*0.28, -wY, 12*this.rL, 12*this.rL);
+        line(-this.bodyLen*0.32,  wY,  this.bodyLen*0.32,  wY);
+        ellipse(-this.bodyLen*0.28,  wY, 12*this.rR, 12*this.rR);
+        ellipse( this.bodyLen*0.28,  wY, 12*this.rR, 12*this.rR);
+        line(this.bodyLen*0.25, 0, this.bodyLen*0.5, 0);
+        pop();
+      }
+    }
+  </script>
+</body>
+</html>

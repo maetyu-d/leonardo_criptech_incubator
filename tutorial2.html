@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Unpowered Slope-Car — asymmetric physics (veer-left with bigger right wheels)</title>
+  <style>
+    html, body { height: 100%; margin: 0; background: #000; color: #fff; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    #ui { position: fixed; top: 12px; left: 50%; transform: translateX(-50%); display: flex; gap: 16px; align-items: center; background: rgba(0,0,0,0.85); padding: 10px 14px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.18); box-shadow: 0 10px 30px rgba(0,0,0,0.25); z-index: 10; }
+    #ui label { font-size: 16px; opacity: 0.9; }
+    #ui input[type=range] { width: 220px; }
+    #startOverlay, #endOverlay, #finalOverlay, #endScreen, #tipOverlay { position: fixed; inset: 0; display: none; place-items: center; background: rgba(0,0,0,1); color: white; font-size: 32px; text-align: center; padding: 40px; z-index: 20; }
+    #startOverlay.show, #endOverlay.show, #finalOverlay.show, #endScreen.show, #tipOverlay.show { display: grid; }
+    #hint { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); font-size: 14px; color: #aaa; letter-spacing: 0.2px; z-index: 10; }
+    #messageOverlay { position: fixed; inset: 0; display: none; place-items: center; background: rgba(0,0,0,0.85); color: white; font-size: 32px; text-align: center; padding: 20px; z-index: 20; }
+    .btn { cursor: pointer; padding: 6px 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.2); background: rgba(255,255,255,0.06); color: #fff; font-weight: 600; }
+    .btn:active { transform: translateY(1px); }
+  </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.2/p5.min.js"></script>
+</head>
+<body>
+  <div id="ui">
+    <label>Wheel asymmetry: <input id="wheelSlider" type="range" min="0" max="2" step="0.1" value="0"> <span id="wheelVal">0</span></label>
+    <label>Slope: <input id="slopeSlider" type="range" min="0" max="30" step="0.1" value="12"> <span id="slopeVal">12.0°</span></label>
+    <button id="resetBtn" class="btn">Reset</button>
+    <button id="clearBtn" class="btn">Clear trails</button>
+  </div>
+
+  <div id="startOverlay"><div>We've taken your toy car to the top of a slope.<br><br>Let's see what it does!<br><br>Remember to experiment with the wheel asymmetry and slope values...</div></div>
+  <div id="endOverlay"><div>Reached the bottom of the hill!<br/><br/><button id="restartBtn" class="btn">Restart</button></div></div>
+  <div id="finalOverlay"><div>The orange car might get there faster, but where is the fun in that?!</div></div>
+  <div id="endScreen"><div>End of Tutorial</div></div>
+  <div id="messageOverlay">Now, let's see how your green car compares to the orange car's standard algorithm!</div>
+  <div id="tipOverlay"><div>Try changing the wheel asymmetry value!</div></div>
+  <div id="hint">Increase asymmetry to make RIGHT wheels larger → car will veer LEFT as it rolls.</div>
+
+<script>
+// -------------------- State --------------------
+let cars = [];
+let trailLayer, gScale = 500;
+let slopeDeg = 12;
+let wheelFactor = 1.0; // physics range 1.00..1.11; UI shows 0..2
+let ended = false;
+let restartClicks = 0;
+let pauseActive = true; // intro pause
+
+// -------------------- Setup --------------------
+function setup(){
+  createCanvas(window.innerWidth, window.innerHeight);
+  pixelDensity(1);
+  trailLayer = createGraphics(width, height);
+  clearTrail();
+  setupUI();
+  runTests(); // basic sanity tests
+
+  // Intro overlay & pause
+  const start = document.getElementById('startOverlay');
+  start.classList.add('show');
+  setTimeout(() => {
+    start.classList.remove('show');
+    pauseActive = false;
+    resetSim();
+  }, 5000);
+}
+
+function windowResized(){
+  const snap = trailLayer.get();
+  resizeCanvas(window.innerWidth, window.innerHeight);
+  const newLayer = createGraphics(width, height);
+  newLayer.background('#000');
+  newLayer.image(snap, 0, 0);
+  trailLayer = newLayer;
+}
+
+function setupUI(){
+  const wS = document.getElementById('wheelSlider');
+  const wV = document.getElementById('wheelVal');
+  const sS = document.getElementById('slopeSlider');
+  const sV = document.getElementById('slopeVal');
+
+  wS.addEventListener('input', () => {
+    // Cosmetic 0..2 -> physical 1.00..1.11
+    const mapped = mapCosmeticToPhysical(parseFloat(wS.value));
+    wheelFactor = mapped;
+    wV.textContent = wS.value; // keep cosmetic label 0..2
+  });
+
+  sS.addEventListener('input', () => {
+    slopeDeg = parseFloat(sS.value);
+    sV.textContent = parseFloat(sS.value).toFixed(1) + '°';
+  });
+
+  document.getElementById('resetBtn').onclick = resetSim;
+  document.getElementById('clearBtn').onclick = clearTrail;
+  document.getElementById('restartBtn').onclick = onRestart;
+}
+
+// -------------------- Controls --------------------
+function onRestart(){
+  restartClicks++;
+  document.getElementById('endOverlay').classList.remove('show');
+  ended = false;
+
+  // If asymmetry still 1.00 (no change), show tip for 5s before restarting
+  if (wheelFactor <= 1.00 + 1e-6) {
+    pauseActive = true;
+    const tip = document.getElementById('tipOverlay');
+    tip.classList.add('show');
+    setTimeout(() => {
+      tip.classList.remove('show');
+      pauseActive = false;
+      resetSim();
+    }, 5000);
+    return;
+  }
+
+  if (restartClicks === 3) {
+    // Special message before the run with two cars
+    pauseActive = true;
+    const msg = document.getElementById('messageOverlay');
+    msg.style.display = 'grid';
+    setTimeout(() => {
+      msg.style.display = 'none';
+      pauseActive = false;
+      resetSim();
+    }, 5000);
+  } else {
+    resetSim();
+  }
+}
+
+function resetSim(){
+  // Fade previous trails to ~10% brightness as ghosts across runs
+  if (trailLayer) {
+    const prev = trailLayer.get();
+    trailLayer.background('#000');
+    trailLayer.push();
+    trailLayer.tint(255, 25);
+    trailLayer.image(prev, 0, 0);
+    trailLayer.pop();
+  }
+  cars = [];
+  // Green (user) car uses live wheelFactor
+  cars.push(new RCcar(width*0.5 - 40, 60, Math.PI/2, { trailColor: '#33FF33', asymFactor: null }));
+  // After 3rd restart, add symmetric orange baseline car
+  if (restartClicks >= 3){
+    cars.push(new RCcar(width*0.5 + 40, 60, Math.PI/2, { trailColor: '#FFA500', asymFactor: 1.0 }));
+  }
+}
+
+function clearTrail(){
+  trailLayer.background('#000000');
+}
+
+// -------------------- Main loop --------------------
+function draw(){
+  if (ended || pauseActive) return;
+
+  // 1) base background
+  drawGradient();
+  // 2) existing trails
+  image(trailLayer, 0, 0);
+  // 3) slope cross-hatching ABOVE trails so it's visible
+  drawSlopeHatching();
+  // 4) track/walls and cars
+  drawTrackLines();
+
+  const dt = deltaTime / 1000;
+  for (const c of cars) { c.update(dt); c.draw(); }
+
+  // End condition (only once)
+  const finishedAll = cars.length > 0 && cars.every(c => c.y > height - 40);
+  if (finishedAll) {
+    ended = true;
+    if (restartClicks >= 3) {
+      const finalOverlay = document.getElementById('finalOverlay');
+      finalOverlay.classList.add('show');
+      setTimeout(() => {
+        finalOverlay.classList.remove('show');
+        document.getElementById('endScreen').classList.add('show');
+        noLoop();
+      }, 5000);
+    } else {
+      document.getElementById('endOverlay').classList.add('show');
+    }
+  }
+}
+
+// -------------------- Rendering helpers --------------------
+function drawGradient(){
+  for (let y=0; y<height; y+=2){
+    const t = y/height;
+    const shade = 10 + Math.floor(50 * t);
+    stroke(shade);
+    line(0,y,width,y);
+  }
+}
+
+// Cross-hatching with angles swapped relative to slope value
+function drawSlopeHatching(){
+  // Two mirrored angle families; as slope increases, they swing the opposite way
+  const angle1 =  radians(25) - radians(slopeDeg * 0.6); // opposite tilt
+  const angle2 = -radians(25) + radians(slopeDeg * 0.6); // mirrored opposite
+  const spacing = 70;
+  const lineLen = Math.hypot(width, height) + 200;
+
+  // First family
+  push();
+  blendMode(BLEND);
+  stroke(170, 100); // light grey
+  strokeWeight(1);
+  translate(width * 0.5, height * 0.3); // bias toward top (uphill)
+  rotate(angle1);
+  for (let x = -lineLen; x <= lineLen; x += spacing){
+    line(x, -lineLen, x, lineLen);
+  }
+  pop();
+
+  // Second family (cross)
+  push();
+  blendMode(BLEND);
+  stroke(100, 70);
+  strokeWeight(1);
+  translate(width * 0.5, height * 0.3);
+  rotate(angle2);
+  for (let x = -lineLen; x <= lineLen; x += spacing){
+    line(x, -lineLen, x, lineLen);
+  }
+  pop();
+}
+
+function drawTrackLines(){
+  const pad = 28;
+  const trackMargin = 80;
+  const midX = width * 0.5;
+  // outer walls
+  stroke(180); strokeWeight(3);
+  line(pad, 0, pad, height);
+  line(width - pad, 0, width - pad, height);
+  // inner track edges
+  stroke(120); strokeWeight(2);
+  const leftEdgeX  = pad + trackMargin;
+  const rightEdgeX = width - pad - trackMargin;
+  line(leftEdgeX, 0, leftEdgeX, height);
+  line(rightEdgeX, 0, rightEdgeX, height);
+  // center dashed guide
+  stroke(140); strokeWeight(1.5);
+  const dash = 16, gap = 12;
+  for (let y=0; y<height; y += dash + gap){
+    line(midX, y, midX, Math.min(y + dash, height));
+  }
+}
+
+// -------------------- Car --------------------
+class RCcar {
+  constructor(x, y, heading, opts = {}) {
+    this.x = x; this.y = y; this.h = heading;
+    this.bodyLen = 69; this.bodyWid = 39;
+    this.v = 0; this.omega = 0;
+    this.prevX = x; this.prevY = y;
+    this.trailColor = opts.trailColor || '#33FF33';
+    // asymFactor: null => use live global wheelFactor; number => fixed per-car factor
+    this.asymFactor = (opts.asymFactor === null || opts.asymFactor === undefined) ? null : opts.asymFactor;
+  }
+
+  update(dt){
+    const theta = radians(slopeDeg);
+    const a_down = gScale * Math.sin(theta); // gravity along +Y
+
+    // Factor for this car (physics uses subtle 1.00–1.11 range)
+    const f = (this.asymFactor === null) ? wheelFactor : this.asymFactor;
+
+    // Wheel radii: RIGHT larger as f grows, LEFT smaller
+    const rL = 1.0 / Math.max(0.5, f);
+    const rR = Math.max(0.5, f);
+
+    // Rolling resistance per side ~ Crr0 * (r0/r) * g * cos(theta)
+    const baseCrr = 0.03;
+    const CrrL = baseCrr * (1.0 / rL);
+    const CrrR = baseCrr * (1.0 / rR);
+    const a_roll_L = CrrL * gScale * Math.cos(theta);
+    const a_roll_R = CrrR * gScale * Math.cos(theta);
+    const a_roll_avg = 0.5 * (a_roll_L + a_roll_R);
+
+    // Air drag ~ k * v^2
+    const dragK = 0.0018;
+    const a_drag = dragK * this.v * this.v * Math.sign(this.v);
+
+    // Project gravity onto car's forward direction
+    let nx = Math.cos(this.h);
+    let ny = Math.sin(this.h);
+    const a_forward_gravity = a_down * ny;
+
+    // Net forward acceleration
+    let a_forward = a_forward_gravity - a_roll_avg - a_drag;
+
+    // Integrate forward speed
+    this.v += a_forward * dt;
+
+    // Yaw from left-right difference (right bigger => less resist => yaw LEFT)
+    const dResist = (a_roll_L - a_roll_R); // >0 => CCW (left)
+    const yawGain = 1.1;
+    const yawDamp = 2.0;
+    this.omega += (yawGain * dResist - yawDamp * this.omega) * dt;
+    this.h += this.omega * dt;
+
+    // Move along new heading
+    nx = Math.cos(this.h);
+    ny = Math.sin(this.h);
+    this.x += this.v * nx * dt;
+    this.y += this.v * ny * dt;
+
+    // Side wall collisions (gentle)
+    const wallPad = 28;
+    const halfWidthApprox = this.bodyWid * 0.5;
+    const leftLimit = wallPad + halfWidthApprox;
+    const rightLimit = width - wallPad - halfWidthApprox;
+    const restitution = 0.65;
+    const spinDamp = 0.6;
+
+    if (this.x < leftLimit){
+      this.x = leftLimit;
+      this.h = Math.PI - this.h; // reflect heading
+      this.h = ((this.h + Math.PI) % (2*Math.PI)) - Math.PI; // normalize
+      this.v *= restitution;
+      this.omega *= spinDamp;
+    }
+    if (this.x > rightLimit){
+      this.x = rightLimit;
+      this.h = Math.PI - this.h;
+      this.h = ((this.h + Math.PI) % (2*Math.PI)) - Math.PI;
+      this.v *= restitution;
+      this.omega *= spinDamp;
+    }
+
+    // Trails
+    if (Math.abs(this.x - this.prevX) < width/2 && Math.abs(this.y - this.prevY) < height/2){
+      trailLayer.push();
+      trailLayer.stroke(this.trailColor);
+      trailLayer.strokeWeight(2);
+      trailLayer.line(this.prevX, this.prevY, this.x, this.y);
+      trailLayer.pop();
+    }
+    this.prevX = this.x; this.prevY = this.y;
+  }
+
+  draw(){
+    push();
+    translate(this.x, this.y);
+    rotate(this.h);
+    stroke(255); noFill(); strokeWeight(2);
+    rectMode(CENTER);
+    rect(0, 0, this.bodyLen, this.bodyWid, 6);
+
+    const halfW = this.bodyWid * 0.5 + 3;
+    const baseWheel = 12;
+    const f = (this.asymFactor === null) ? wheelFactor : this.asymFactor;
+
+    // Exaggerate visually only (not in physics)
+    const exaggeration = 3.0; 
+    const dLeft  = baseWheel / (1 + (f - 1) * exaggeration);
+    const dRight = baseWheel * (1 + (f - 1) * exaggeration);
+
+    // LEFT side (local -Y)
+    ellipse(-this.bodyLen*0.28, -halfW, dLeft, dLeft);
+    ellipse( this.bodyLen*0.28, -halfW, dLeft, dLeft);
+
+    // RIGHT side (local +Y)
+    ellipse(-this.bodyLen*0.28,  halfW, dRight, dRight);
+    ellipse( this.bodyLen*0.28,  halfW, dRight, dRight);
+
+    // Forward marker
+    line(this.bodyLen*0.25,0,this.bodyLen*0.5,0);
+    pop();
+  }
+}
+
+// -------------------- Utilities & Tests --------------------
+function mapCosmeticToPhysical(v){
+  // v in [0,2] -> [1.00, 1.11]
+  return 1.00 + (v/2) * 0.11;
+}
+
+function runTests(){
+  try {
+    console.assert(typeof drawSlopeHatching === 'function', 'drawSlopeHatching should exist');
+    console.assert(Math.abs(mapCosmeticToPhysical(0) - 1.00) < 1e-9, 'Slider map 0 -> 1.00');
+    console.assert(Math.abs(mapCosmeticToPhysical(2) - 1.11) < 1e-9, 'Slider map 2 -> 1.11');
+    console.assert(!!document.getElementById('startOverlay'), 'startOverlay present');
+    console.assert(!!document.getElementById('finalOverlay'), 'finalOverlay present');
+    console.assert(!!document.getElementById('endScreen'), 'endScreen present');
+  } catch (e) {
+    console.error('Self-tests failed:', e);
+  }
+}
+</script>
+</body>
+</html>
