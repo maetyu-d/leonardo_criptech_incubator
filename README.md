@@ -1,6 +1,8 @@
+**limp.freq (2025)**
+
 limp.freq was developed as part of the Leonardo/ISAST CripTech AI Incubator from July to November 2025, for the virtual exhibition Slow AI (https://leonardo.info/slow-ai/) curated by M Eilo. Special thanks to M Eilo, the team at Leonardo (Vanessa Chang, Jason Lam, Maya Hilbert, Claudia Alick), and all who gave feedback over the weeks. You can access limp.freq at the Leonardo/ISAST site here: https://leonardo.info/slow-ai/limp-freq
 
-**Project Description/About limp.freq**
+**Project Description**
 
 limp.freq deploys a population of self-navigating, cybernetics-inspired bots to examine how even relatively modest bodily asymmetries–exemplified by the artist’s own leg-length discrepancy (LLD)–shape behaviour not only at the scale of the individual (or the individual body), influencing posture, balance, and locomotion, but also generatively, as their effects cascade into collective perception, navigation, and environmental sense-making at architectural and spatial design scales.
 
